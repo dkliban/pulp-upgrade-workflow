@@ -1,0 +1,92 @@
+id: 527311f3-d5cf-4736-b88a-215c12f332d4
+name: pulp-upgrade-check
+description: >-
+  Check all Pulp dependencies for newer PyPI versions, clone upstream repos
+  at the new tags, and validate that pulp-service patches apply cleanly.
+  Reports which patches are upstreamed, which need regeneration, and which
+  apply without issues.
+version: 1
+tags: {}
+inputs:
+  properties:
+    packages:
+      type: array
+      description: List of packages to check for upgrades
+      default:
+        - package: pulpcore
+          ghOrg: pulp
+          ghRepo: pulpcore
+          patchDirPrefix: pulpcore
+        - package: pulp-container
+          ghOrg: pulp
+          ghRepo: pulp_container
+          patchDirPrefix: pulp_container
+        - package: pulp-python
+          ghOrg: pulp
+          ghRepo: pulp_python
+          patchDirPrefix: pulp_python
+        - package: pulp-rpm
+          ghOrg: pulp
+          ghRepo: pulp_rpm
+          patchDirPrefix: pulp_rpm
+        - package: pulp-maven
+          ghOrg: pulp
+          ghRepo: pulp_maven
+          patchDirPrefix: pulp_maven
+        - package: pulp-file
+          ghOrg: pulp
+          ghRepo: pulp_file
+          patchDirPrefix: pulp_file
+        - package: pulp-npm
+          ghOrg: pulp
+          ghRepo: pulp_npm
+          patchDirPrefix: pulp_npm
+        - package: pulp-gem
+          ghOrg: pulp
+          ghRepo: pulp_gem
+          patchDirPrefix: pulp_gem
+        - package: oras
+          ghOrg: oras-project
+          ghRepo: oras-py
+          patchDirPrefix: oras
+        - package: django-storages
+          ghOrg: jschneier
+          ghRepo: django-storages
+          patchDirPrefix: storages
+jobs:
+  - name: setup
+    description: Clone the pulp-service repository
+    steps:
+      - name: clone-service
+        description: Clone pulp-service to get requirements.txt and patches
+        task:
+          type: model_method
+          modelIdOrName: clone-pulp-service
+          methodName: execute
+
+  - name: process-packages
+    description: Check PyPI and validate patches for each package
+    dependsOn:
+      - job: setup
+        condition:
+          type: succeeded
+    steps:
+      - name: process-${{ self.pkg.package }}
+        description: Check version and process patches for a single package
+        forEach:
+          item: pkg
+          in: ${{ inputs.packages }}
+        task:
+          type: model_method
+          modelIdOrName: process-package
+          methodName: execute
+          inputs:
+            package: ${{ self.pkg.package }}
+            ghOrg: ${{ self.pkg.ghOrg }}
+            ghRepo: ${{ self.pkg.ghRepo }}
+            patchDirPrefix: ${{ self.pkg.patchDirPrefix }}
+            pulpServicePath: ${{ data.latest("clone-pulp-service", "result").attributes.stdout }}
+        dataOutputOverrides:
+          - specName: result
+            vary:
+              - package

@@ -1,0 +1,21 @@
+type: command/shell
+typeVersion: 2026.02.09.1
+id: 96edac2c-78cc-479a-8b67-6f3726821477
+name: clone-pulp-service
+version: 1
+tags: {}
+globalArguments: {}
+methods:
+  execute:
+    arguments:
+      run: |
+        set -euo pipefail
+        WORKDIR="/tmp/pulp-upgrade-work"
+        mkdir -p "$WORKDIR"
+        if [ -d "$WORKDIR/pulp-service" ]; then
+          cd "$WORKDIR/pulp-service" && git pull --ff-only >&2
+        else
+          git clone --depth 1 https://github.com/pulp/pulp-service.git "$WORKDIR/pulp-service" >&2
+        fi
+        printf '%s' "$WORKDIR/pulp-service"
+      timeout: 120000
