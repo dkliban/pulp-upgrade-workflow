@@ -439,17 +439,30 @@ methods:
         old_tag = resolve_tag(repo_path, CUR_VER)
         reset_repo(repo_path, new_tag)
 
-        # --- Phase 3: Find patches targeting this package ---
+        # --- Phase 3: Find patches targeting this package (only those in Dockerfile) ---
         patches_dir = os.path.join(SVC_PATH, "images", "assets", "patches")
         patch_files = sorted(glob.glob(os.path.join(patches_dir, "*.patch")))
 
+        # Only consider patches that are referenced in the Dockerfile
+        dockerfile_ref_patches = set()
+        df_path = os.path.join(SVC_PATH, "Dockerfile")
+        if os.path.isfile(df_path):
+            with open(df_path) as df:
+                for line in df:
+                    m = re.search(r'patches/(\S+\.patch)', line)
+                    if m:
+                        dockerfile_ref_patches.add(m.group(1))
+
         matching_patches = []
         for pf in patch_files:
+            fname = os.path.basename(pf)
+            if fname not in dockerfile_ref_patches:
+                continue
             with open(pf) as f:
                 content = f.read()
             pat = rf"diff --git a/{re.escape(PATCH_PREFIX)}/"
             if re.search(pat, content):
-                matching_patches.append({"filename": os.path.basename(pf), "path": pf})
+                matching_patches.append({"filename": fname, "path": pf})
 
         if not matching_patches:
             result = {
