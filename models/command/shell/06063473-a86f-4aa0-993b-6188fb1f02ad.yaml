@@ -404,6 +404,18 @@ methods:
 
         print(f"{PKG}: {CUR_VER} -> {NEW_VER}", file=sys.stderr)
 
+        # --- Update requirements.txt with the new version ---
+        req_path = os.path.join(SVC_PATH, "pulp_service", "requirements.txt")
+        normalized = re.sub(r'[-_.]+', '[-_.]+', PKG.lower())
+        with open(req_path) as f:
+            req_lines = f.readlines()
+        with open(req_path, 'w') as f:
+            for line in req_lines:
+                if re.match(rf'^({normalized})==', line.strip(), re.IGNORECASE):
+                    f.write(f"{PKG}=={NEW_VER}\n")
+                else:
+                    f.write(line)
+
         # --- Phase 1: Clone or update upstream repo ---
         repo_path = os.path.join(WORKDIR, GH_REPO)
         clone_url = f"https://github.com/{GH_ORG}/{GH_REPO}.git"
