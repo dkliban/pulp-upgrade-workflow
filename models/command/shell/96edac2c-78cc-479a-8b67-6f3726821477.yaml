@@ -10,12 +10,14 @@ methods:
     arguments:
       run: |
         set -euo pipefail
-        HOSTNAME_VAL=$(hostname 2>/dev/null || echo "")
-        if [[ "$HOSTNAME_VAL" == alcove-task* ]]; then
-          WORKDIR="/workspace/pulp-upgrade-work"
-        else
-          WORKDIR="/tmp/pulp-upgrade-work"
+        # If /workspace/pulp-service exists (alcove Skiff environment), use it directly.
+        # The workflow will modify patches, Dockerfile, and requirements.txt in place.
+        if [ -d "/workspace/pulp-service/pulp_service" ]; then
+          printf '%s' "/workspace/pulp-service"
+          exit 0
         fi
+        # Otherwise clone fresh (local development)
+        WORKDIR="/tmp/pulp-upgrade-work"
         mkdir -p "$WORKDIR"
         if [ -d "$WORKDIR/pulp-service" ]; then
           cd "$WORKDIR/pulp-service" && git pull --ff-only >&2
