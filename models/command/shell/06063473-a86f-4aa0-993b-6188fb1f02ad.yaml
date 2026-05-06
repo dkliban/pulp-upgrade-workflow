@@ -70,7 +70,12 @@ methods:
         GH_REPO = os.environ["GH_REPO"]
         PATCH_PREFIX = os.environ["PATCH_PREFIX"]
         SVC_PATH = os.environ["SVC_PATH"]
-        WORKDIR = "/tmp/pulp-upgrade-work"
+        import socket
+        hostname = socket.gethostname()
+        if hostname.startswith("alcove-task"):
+            WORKDIR = "/workspace/pulp-upgrade-work"
+        else:
+            WORKDIR = "/tmp/pulp-upgrade-work"
 
         def run(cmd, cwd=None, check=True, capture=True):
             r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=capture, text=True)
