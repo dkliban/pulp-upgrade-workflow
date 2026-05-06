@@ -45,7 +45,25 @@ methods:
         import sys
         import tempfile
         import urllib.request
-        from packaging.version import Version
+
+        def parse_version(v):
+            """Parse a PEP 440 version string into a comparable tuple."""
+            parts = []
+            for segment in re.split(r'[.\-]', re.sub(r'[^0-9.\-]', '', v)):
+                if segment:
+                    parts.append(int(segment))
+            return tuple(parts)
+
+        class Version:
+            def __init__(self, v):
+                self._raw = v
+                self._key = parse_version(v)
+            def __gt__(self, other):
+                return self._key > other._key
+            def __ge__(self, other):
+                return self._key >= other._key
+            def __eq__(self, other):
+                return self._key == other._key
 
         PKG = os.environ["PKG_NAME"]
         GH_ORG = os.environ["GH_ORG"]
