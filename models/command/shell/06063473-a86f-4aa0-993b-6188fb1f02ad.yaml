@@ -19,18 +19,22 @@ inputs:
     patchDirPrefix:
       type: string
       description: Directory prefix used in patch file diff headers
+    initialVersion:
+      type: string
+      description: Current version the patches were written for
+    finalVersion:
+      type: string
+      description: Target version to upgrade to
     pulpServicePath:
       type: string
-      description: Path to cloned pulp-service repo
-    currentVersion:
-      type: string
-      description: Override current version (if not in requirements.txt)
-      default: ""
+      description: Path to the pulp-service repo
   required:
     - package
     - ghOrg
     - ghRepo
     - patchDirPrefix
+    - initialVersion
+    - finalVersion
     - pulpServicePath
 methods:
   execute:
@@ -43,37 +47,19 @@ methods:
         import re
         import subprocess
         import sys
+        import socket
         import tempfile
-        import urllib.request
-
-        def parse_version(v):
-            """Parse a PEP 440 version string into a comparable tuple."""
-            parts = []
-            for segment in re.split(r'[.\-]', re.sub(r'[^0-9.\-]', '', v)):
-                if segment:
-                    parts.append(int(segment))
-            return tuple(parts)
-
-        class Version:
-            def __init__(self, v):
-                self._raw = v
-                self._key = parse_version(v)
-            def __gt__(self, other):
-                return self._key > other._key
-            def __ge__(self, other):
-                return self._key >= other._key
-            def __eq__(self, other):
-                return self._key == other._key
 
         PKG = os.environ["PKG_NAME"]
         GH_ORG = os.environ["GH_ORG"]
         GH_REPO = os.environ["GH_REPO"]
         PATCH_PREFIX = os.environ["PATCH_PREFIX"]
+        CUR_VER = os.environ["INITIAL_VERSION"]
+        NEW_VER = os.environ["FINAL_VERSION"]
         SVC_PATH = os.environ["SVC_PATH"]
-        import socket
         hostname = socket.gethostname()
         if hostname.startswith("alcove-task"):
-            WORKDIR = "/workspace/pulp-upgrade-work"
+            WORKDIR = "/workspace"
         else:
             WORKDIR = "/tmp/pulp-upgrade-work"
 
@@ -319,102 +305,17 @@ methods:
                 return "", "all changes upstreamed (combined diff is empty)"
             return combined_diff, None
 
-        # --- Phase 0: Version discovery ---
-        def find_version_in_requirements(svc_path, pkg_name):
-            req_path = os.path.join(svc_path, "pulp_service", "requirements.txt")
-            normalized = re.sub(r'[-_.]+', '[-_.]+', pkg_name.lower())
-            with open(req_path) as f:
-                for line in f:
-                    line = line.strip()
-                    m = re.match(rf'^({normalized})==([^\s,;\[]+)', line, re.IGNORECASE)
-                    if m:
-                        return m.group(2)
-            return None
-
-        def find_version_in_upstream_deps(workdir, svc_path, pkg_name):
-            normalized = re.sub(r'[-_.]+', '[-_.]+', pkg_name.lower())
-            pattern = re.compile(rf'{normalized}(?:\[[\w,]*\])?==([^\s,"\']+)', re.IGNORECASE)
-            req_path = os.path.join(svc_path, "pulp_service", "requirements.txt")
-            with open(req_path) as f:
-                req_lines = f.readlines()
-            for repo_dir in glob.glob(os.path.join(workdir, "*")):
-                if not os.path.isdir(os.path.join(repo_dir, ".git")):
-                    continue
-                repo_name = os.path.basename(repo_dir)
-                repo_ver = None
-                for line in req_lines:
-                    line = line.strip()
-                    rn = re.sub(r'[-_.]+', '[-_.]+', repo_name.lower())
-                    m = re.match(rf'^({rn})==([^\s,;\[]+)', line, re.IGNORECASE)
-                    if m:
-                        repo_ver = m.group(2)
-                        break
-                if not repo_ver:
-                    continue
-                tag = resolve_tag(repo_dir, repo_ver)
-                if not tag:
-                    continue
-                for cfg in ["pyproject.toml", "setup.cfg"]:
-                    r = run(f"git show {tag}:{cfg}", cwd=repo_dir, check=False)
-                    if r.returncode != 0:
-                        continue
-                    for line in r.stdout.splitlines():
-                        m = pattern.search(line)
-                        if m:
-                            return m.group(1)
-            return None
-
-        CUR_VER = find_version_in_requirements(SVC_PATH, PKG)
-        if not CUR_VER:
-            CUR_VER = find_version_in_upstream_deps(WORKDIR, SVC_PATH, PKG)
-        if not CUR_VER:
-            CUR_VER = os.environ.get("CUR_VERSION", "")
-
-        if not CUR_VER:
-            result = {
-                "package": PKG, "status": "skipped",
-                "reason": f"Package {PKG} not found in requirements.txt or upstream deps",
-                "patches": [],
-            }
-            print(json.dumps(result))
-            sys.exit(0)
-
-        try:
-            url = f"https://pypi.org/pypi/{PKG}/json"
-            resp = urllib.request.urlopen(url, timeout=15)
-            pypi_data = json.loads(resp.read())
-            NEW_VER = pypi_data["info"]["version"]
-        except Exception as e:
-            result = {
-                "package": PKG, "currentVersion": CUR_VER,
-                "status": "error", "reason": f"Failed to query PyPI: {e}",
-                "patches": [],
-            }
-            print(json.dumps(result))
-            sys.exit(0)
-
-        if not Version(NEW_VER) > Version(CUR_VER):
+        # --- Phase 0: Check versions ---
+        if CUR_VER == NEW_VER:
             result = {
                 "package": PKG, "currentVersion": CUR_VER, "latestVersion": NEW_VER,
                 "status": "up_to_date", "patches": [],
-                "summary": f"{PKG} is up to date ({CUR_VER} >= {NEW_VER})",
+                "summary": f"{PKG} is up to date ({CUR_VER})",
             }
             print(json.dumps(result))
             sys.exit(0)
 
         print(f"{PKG}: {CUR_VER} -> {NEW_VER}", file=sys.stderr)
-
-        # --- Update requirements.txt with the new version ---
-        req_path = os.path.join(SVC_PATH, "pulp_service", "requirements.txt")
-        normalized = re.sub(r'[-_.]+', '[-_.]+', PKG.lower())
-        with open(req_path) as f:
-            req_lines = f.readlines()
-        with open(req_path, 'w') as f:
-            for line in req_lines:
-                if re.match(rf'^({normalized})==', line.strip(), re.IGNORECASE):
-                    f.write(f"{PKG}=={NEW_VER}\n")
-                else:
-                    f.write(line)
 
         # --- Phase 1: Clone or update upstream repo ---
         repo_path = os.path.join(WORKDIR, GH_REPO)
@@ -760,5 +661,6 @@ methods:
         GH_ORG: ${{ inputs.ghOrg }}
         GH_REPO: ${{ inputs.ghRepo }}
         PATCH_PREFIX: ${{ inputs.patchDirPrefix }}
+        INITIAL_VERSION: ${{ inputs.initialVersion }}
+        FINAL_VERSION: ${{ inputs.finalVersion }}
         SVC_PATH: ${{ inputs.pulpServicePath }}
-        CUR_VERSION: ${{ inputs.currentVersion }}
