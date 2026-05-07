@@ -61,6 +61,49 @@ methods:
             run(f"git checkout -f {tag}", cwd=repo_path)
             run("git clean -fdx", cwd=repo_path)
 
+        def resolve_conflict_markers(content, filepath=""):
+            """Resolve git conflict markers. Try union merge first, fall back to theirs."""
+            # Strategy 1: union merge (keep both sides)
+            union = re.sub(r'<<<<<<< ours\n', '', content)
+            union = re.sub(r'=======\n', '', union)
+            union = re.sub(r'>>>>>>> theirs\n', '', union)
+
+            # For Python files, validate syntax
+            if filepath.endswith('.py'):
+                try:
+                    compile(union, filepath, 'exec')
+                    return union
+                except SyntaxError:
+                    pass
+
+                # Strategy 2: keep theirs (the patch's version) for each conflict
+                lines = content.splitlines(True)
+                result = []
+                in_ours = False
+                in_theirs = False
+                for line in lines:
+                    if line.startswith('<<<<<<< ours\n'):
+                        in_ours = True
+                        continue
+                    elif line.startswith('=======\n') and in_ours:
+                        in_ours = False
+                        in_theirs = True
+                        continue
+                    elif line.startswith('>>>>>>> theirs\n'):
+                        in_theirs = False
+                        continue
+                    if not in_ours:
+                        result.append(line)
+                theirs_result = ''.join(result)
+
+                try:
+                    compile(theirs_result, filepath, 'exec')
+                    return theirs_result
+                except SyntaxError:
+                    pass
+
+            return union
+
         def regenerate_patch(repo_path, old_tag, new_tag, patch_path, patch_prefix):
             with open(patch_path) as f:
                 full_content = f.read()
@@ -95,9 +138,7 @@ methods:
                             continue
                         with open(fpath) as fh:
                             content = fh.read()
-                        resolved = re.sub(r'<<<<<<< ours\n', '', content)
-                        resolved = re.sub(r'=======\n', '', resolved)
-                        resolved = re.sub(r'>>>>>>> theirs\n', '', resolved)
+                        resolved = resolve_conflict_markers(content, fpath)
                         with open(fpath, 'w') as fh:
                             fh.write(resolved)
                         run(f"git add -- '{uf}'", cwd=repo_path, check=False)
@@ -185,9 +226,7 @@ methods:
                             return False, f"cannot resolve conflict in {uf}"
                         with open(fpath) as fh:
                             content = fh.read()
-                        resolved = re.sub(r'<<<<<<< ours\n', '', content)
-                        resolved = re.sub(r'=======\n', '', resolved)
-                        resolved = re.sub(r'>>>>>>> theirs\n', '', resolved)
+                        resolved = resolve_conflict_markers(content, fpath)
                         with open(fpath, 'w') as fh:
                             fh.write(resolved)
                         run(f"git add -- '{uf}'", cwd=repo_path, check=False)
