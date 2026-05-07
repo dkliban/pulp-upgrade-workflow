@@ -535,6 +535,29 @@ methods:
                     if pkg_def["package"] == pkg_name:
                         version_updates[pkg_def["patchDirPrefix"]] = new_ver
 
+        # Update requirements.txt with new versions
+        if version_updates:
+            req_path = os.path.join(SVC_PATH, "pulp_service", "requirements.txt")
+            if os.path.isfile(req_path):
+                pkg_ver_map = {}
+                for pkg_def in packages_to_upgrade:
+                    if pkg_def["patchDirPrefix"] in version_updates:
+                        pkg_ver_map[pkg_def["package"]] = version_updates[pkg_def["patchDirPrefix"]]
+                with open(req_path) as f:
+                    req_lines = f.readlines()
+                with open(req_path, 'w') as f:
+                    for line in req_lines:
+                        matched = False
+                        for pkg_name, new_ver in pkg_ver_map.items():
+                            normalized = re.sub(r'[-_.]+', '[-_.]+', pkg_name.lower())
+                            if re.match(rf'^({normalized})==', line.strip(), re.IGNORECASE):
+                                f.write(f"{pkg_name}=={new_ver}\n")
+                                matched = True
+                                break
+                        if not matched:
+                            f.write(line)
+                print("Updated requirements.txt", file=sys.stderr)
+
         if deleted_patches or combined_into or version_updates:
             with open(claude_path) as f:
                 lines = f.readlines()
