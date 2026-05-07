@@ -62,47 +62,22 @@ methods:
             run("git clean -fdx", cwd=repo_path)
 
         def resolve_conflict_markers(content, filepath=""):
-            """Resolve git conflict markers. Try union merge first, fall back to theirs."""
-            # Strategy 1: union merge (keep both sides)
-            union = re.sub(r'<<<<<<< ours\n', '', content)
-            union = re.sub(r'=======\n', '', union)
-            union = re.sub(r'>>>>>>> theirs\n', '', union)
-
-            # For Python files, validate syntax
-            if filepath.endswith('.py'):
-                try:
-                    compile(union, filepath, 'exec')
-                    return union
-                except SyntaxError:
-                    pass
-
-                # Strategy 2: keep theirs (the patch's version) for each conflict
-                lines = content.splitlines(True)
-                result = []
-                in_ours = False
-                in_theirs = False
-                for line in lines:
-                    if line.startswith('<<<<<<< ours\n'):
-                        in_ours = True
-                        continue
-                    elif line.startswith('=======\n') and in_ours:
-                        in_ours = False
-                        in_theirs = True
-                        continue
-                    elif line.startswith('>>>>>>> theirs\n'):
-                        in_theirs = False
-                        continue
-                    if not in_ours:
-                        result.append(line)
-                theirs_result = ''.join(result)
-
-                try:
-                    compile(theirs_result, filepath, 'exec')
-                    return theirs_result
-                except SyntaxError:
-                    pass
-
-            return union
+            """Resolve git conflict markers by keeping theirs (the patch's version)."""
+            lines = content.splitlines(True)
+            result = []
+            in_ours = False
+            for line in lines:
+                if line.startswith('<<<<<<< ours\n'):
+                    in_ours = True
+                    continue
+                elif line.startswith('=======\n') and in_ours:
+                    in_ours = False
+                    continue
+                elif line.startswith('>>>>>>> theirs\n'):
+                    continue
+                if not in_ours:
+                    result.append(line)
+            return ''.join(result)
 
         def verify_patch_syntax(repo_path, new_tag, patch_path):
             """Apply a patch, fix missing imports, check syntax, update patch if needed."""
@@ -122,6 +97,13 @@ methods:
                     continue
                 with open(py_file) as pf:
                     patched = pf.read()
+                # Deduplicate imports first
+                deduped = deduplicate_imports(patched)
+                if deduped != patched:
+                    patched = deduped
+                    with open(py_file, 'w') as pf:
+                        pf.write(patched)
+                    patched_changed = True
                 try:
                     compile(patched, m.group(1), 'exec')
                 except SyntaxError as e:
