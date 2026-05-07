@@ -1,41 +1,12 @@
 type: command/shell
 typeVersion: 2026.02.09.1
 id: 06063473-a86f-4aa0-993b-6188fb1f02ad
-name: process-package
+name: upgrade-patches
 version: 1
 tags: {}
 globalArguments: {}
 inputs:
-  properties:
-    package:
-      type: string
-      description: PyPI package name
-    ghOrg:
-      type: string
-      description: GitHub organization
-    ghRepo:
-      type: string
-      description: GitHub repository name
-    patchDirPrefix:
-      type: string
-      description: Directory prefix used in patch file diff headers
-    initialVersion:
-      type: string
-      description: Current version the patches were written for
-    finalVersion:
-      type: string
-      description: Target version to upgrade to
-    pulpServicePath:
-      type: string
-      description: Path to the pulp-service repo
-  required:
-    - package
-    - ghOrg
-    - ghRepo
-    - patchDirPrefix
-    - initialVersion
-    - finalVersion
-    - pulpServicePath
+  properties: {}
 methods:
   execute:
     arguments:
@@ -45,23 +16,20 @@ methods:
         import json
         import os
         import re
+        import socket
         import subprocess
         import sys
-        import socket
         import tempfile
+        import urllib.request
 
-        PKG = os.environ["PKG_NAME"]
-        GH_ORG = os.environ["GH_ORG"]
-        GH_REPO = os.environ["GH_REPO"]
-        PATCH_PREFIX = os.environ["PATCH_PREFIX"]
-        CUR_VER = os.environ["INITIAL_VERSION"]
-        NEW_VER = os.environ["FINAL_VERSION"]
-        SVC_PATH = os.environ["SVC_PATH"]
         hostname = socket.gethostname()
         if hostname.startswith("alcove-task"):
             WORKDIR = "/workspace"
         else:
             WORKDIR = "/tmp/pulp-upgrade-work"
+        os.makedirs(WORKDIR, exist_ok=True)
+
+        # ── Utilities ──────────────────────────────────────────────
 
         def run(cmd, cwd=None, check=True, capture=True):
             r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=capture, text=True)
@@ -79,17 +47,14 @@ methods:
             return None
 
         def filter_patch_for_prefix(patch_content, prefix):
-            """Extract only the hunks targeting files under the given prefix."""
             output_lines = []
-            in_relevant_diff = False
-            prefix_pattern = re.compile(rf'^diff --git a/{re.escape(prefix)}/')
-
+            in_relevant = False
+            pat = re.compile(rf'^diff --git a/{re.escape(prefix)}/')
             for line in patch_content.splitlines(True):
                 if line.startswith("diff --git "):
-                    in_relevant_diff = bool(prefix_pattern.match(line))
-                if in_relevant_diff:
+                    in_relevant = bool(pat.match(line))
+                if in_relevant:
                     output_lines.append(line)
-
             return "".join(output_lines)
 
         def reset_repo(repo_path, tag):
@@ -97,30 +62,19 @@ methods:
             run("git clean -fdx", cwd=repo_path)
 
         def regenerate_patch(repo_path, old_tag, new_tag, patch_path, patch_prefix):
-            """Regenerate a patch for the new version using multiple strategies."""
-            fname = os.path.basename(patch_path)
-
             with open(patch_path) as f:
                 full_content = f.read()
-
             filtered = filter_patch_for_prefix(full_content, patch_prefix)
             if not filtered.strip():
                 return None, "no hunks for this package"
-
             with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as tmp:
                 tmp.write(filtered)
                 tmp_path = tmp.name
-
             try:
-                # Strategy 1: Apply with fuzz at new version
                 reset_repo(repo_path, new_tag)
-                fuzz_r = run(
-                    f"patch --no-backup-if-mismatch -p1 --fuzz=3 < {tmp_path}",
-                    cwd=repo_path, check=False
-                )
+                fuzz_r = run(f"patch --no-backup-if-mismatch -p1 --fuzz=3 < {tmp_path}", cwd=repo_path, check=False)
                 if fuzz_r.returncode == 0:
-                    run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f",
-                        cwd=repo_path, check=False)
+                    run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
                     new_diff = run("git diff", cwd=repo_path, check=False).stdout
                     reset_repo(repo_path, new_tag)
                     if not new_diff.strip():
@@ -128,23 +82,11 @@ methods:
                         return "", "upstreamed (fuzz apply produced no diff)"
                     os.unlink(tmp_path)
                     return new_diff, None
-
-                # Strategy 2: git apply --3way with union conflict resolution
                 reset_repo(repo_path, new_tag)
-                threeway_r = run(
-                    f"git apply --3way -p1 < {tmp_path}",
-                    cwd=repo_path, check=False
-                )
+                run(f"git apply --3way -p1 < {tmp_path}", cwd=repo_path, check=False)
                 os.unlink(tmp_path)
-
-                # Check for unmerged files
-                unmerged = run(
-                    "git diff --name-only --diff-filter=U",
-                    cwd=repo_path, check=False
-                ).stdout.strip()
-
+                unmerged = run("git diff --name-only --diff-filter=U", cwd=repo_path, check=False).stdout.strip()
                 if unmerged:
-                    # Resolve conflicts with union merge (keep both sides)
                     resolved_all = True
                     for uf in unmerged.splitlines():
                         fpath = os.path.join(repo_path, uf)
@@ -159,103 +101,82 @@ methods:
                         with open(fpath, 'w') as fh:
                             fh.write(resolved)
                         run(f"git add -- '{uf}'", cwd=repo_path, check=False)
-
                     if not resolved_all:
                         reset_repo(repo_path, new_tag)
                         return None, f"could not resolve conflicts in: {unmerged}"
-
                 new_diff = run("git diff HEAD", cwd=repo_path, check=False).stdout
                 reset_repo(repo_path, new_tag)
-
                 if not new_diff.strip():
                     return "", "upstreamed (no diff after 3way merge)"
-
                 return new_diff, None
-
             except Exception as e:
                 reset_repo(repo_path, new_tag)
                 return None, str(e)
 
         def rebuild_patch_file(original_path, patch_prefix, new_diff, original_content):
-            """Replace only this package's hunks in the original patch file."""
             other_hunks = []
-            in_other_diff = False
-            prefix_pattern = re.compile(rf'^diff --git a/{re.escape(patch_prefix)}/')
-
+            in_other = False
+            pat = re.compile(rf'^diff --git a/{re.escape(patch_prefix)}/')
             for line in original_content.splitlines(True):
                 if line.startswith("diff --git "):
-                    in_other_diff = not prefix_pattern.match(line)
-                if in_other_diff:
+                    in_other = not pat.match(line)
+                if in_other:
                     other_hunks.append(line)
-
             rebuilt = "".join(other_hunks) + new_diff
             if rebuilt and not rebuilt.endswith("\n"):
                 rebuilt += "\n"
             return rebuilt
 
         def find_patch_groups(patches, patch_prefix):
-            """Group patches that modify overlapping files (transitive closure)."""
             file_sets = {}
             for mp in patches:
                 with open(mp['path']) as f:
                     content = f.read()
                 files = set()
-                for m in re.finditer(
-                    r'diff --git a/(' + re.escape(patch_prefix) + r'/\S+)', content
-                ):
+                for m in re.finditer(r'diff --git a/(' + re.escape(patch_prefix) + r'/\S+)', content):
                     files.add(m.group(1))
                 file_sets[mp['filename']] = files
-
-            groups = []
-            used = set()
+            groups, used = [], set()
             for mp in patches:
                 if mp['filename'] in used:
                     continue
                 group = [mp]
                 used.add(mp['filename'])
-                group_files = set(file_sets.get(mp['filename'], set()))
+                gf = set(file_sets.get(mp['filename'], set()))
                 changed = True
                 while changed:
                     changed = False
                     for mp2 in patches:
                         if mp2['filename'] in used:
                             continue
-                        if group_files & file_sets.get(mp2['filename'], set()):
+                        if gf & file_sets.get(mp2['filename'], set()):
                             group.append(mp2)
                             used.add(mp2['filename'])
-                            group_files |= file_sets[mp2['filename']]
+                            gf |= file_sets[mp2['filename']]
                             changed = True
                 groups.append(group)
             return groups
 
         def apply_single_patch(repo_path, old_tag, new_tag, patch_path, patch_prefix):
-            """Try to apply a single filtered patch. Returns (success, diff_or_error)."""
             with open(patch_path) as f:
                 full_content = f.read()
             filtered = filter_patch_for_prefix(full_content, patch_prefix)
             if not filtered.strip():
                 return True, ""
-
             with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as tmp:
                 tmp.write(filtered)
                 tmp_path = tmp.name
-
             try:
-                # Try direct apply
                 r = run(f"patch --no-backup-if-mismatch -p1 < {tmp_path}", cwd=repo_path, check=False)
                 if r.returncode == 0:
                     run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
                     return True, None
-
-                # Try fuzz
                 r = run(f"patch --no-backup-if-mismatch -p1 --fuzz=3 < {tmp_path}", cwd=repo_path, check=False)
                 if r.returncode == 0:
                     run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
                     return True, None
-
-                # Try git apply --3way
                 run("git checkout -- .", cwd=repo_path, check=False)
-                r = run(f"git apply --3way -p1 < {tmp_path}", cwd=repo_path, check=False)
+                run(f"git apply --3way -p1 < {tmp_path}", cwd=repo_path, check=False)
                 unmerged = run("git diff --name-only --diff-filter=U", cwd=repo_path, check=False).stdout.strip()
                 if unmerged:
                     for uf in unmerged.splitlines():
@@ -275,16 +196,13 @@ methods:
                 os.unlink(tmp_path)
 
         def combine_patch_group(repo_path, old_tag, new_tag, group, patch_prefix):
-            """Apply all patches in group sequentially, produce combined diff."""
             reset_repo(repo_path, new_tag)
             errors = []
             for mp in group:
                 ok, err = apply_single_patch(repo_path, old_tag, new_tag, mp['path'], patch_prefix)
                 if not ok:
                     errors.append(f"{mp['filename']}: {err}")
-
             if errors:
-                # Fallback: try regenerating each patch via rebase first, then combine
                 reset_repo(repo_path, new_tag)
                 for mp in group:
                     new_diff, err = regenerate_patch(repo_path, old_tag, new_tag, mp['path'], patch_prefix)
@@ -297,370 +215,305 @@ methods:
                             tmp_path = tmp.name
                         run(f"git apply -p0 < {tmp_path}", cwd=repo_path, check=False)
                         os.unlink(tmp_path)
-
             combined_diff = run("git diff", cwd=repo_path, check=False).stdout
             reset_repo(repo_path, new_tag)
-
             if not combined_diff.strip():
                 return "", "all changes upstreamed (combined diff is empty)"
             return combined_diff, None
 
-        # --- Phase 0: Check versions ---
-        if CUR_VER == NEW_VER:
-            result = {
-                "package": PKG, "currentVersion": CUR_VER, "latestVersion": NEW_VER,
-                "status": "up_to_date", "patches": [],
-                "summary": f"{PKG} is up to date ({CUR_VER})",
-            }
-            print(json.dumps(result))
-            sys.exit(0)
+        # ── Phase 0: Clone/reuse pulp-service ──────────────────────
 
-        print(f"{PKG}: {CUR_VER} -> {NEW_VER}", file=sys.stderr)
-
-        # --- Phase 1: Clone or update upstream repo ---
-        repo_path = os.path.join(WORKDIR, GH_REPO)
-        clone_url = f"https://github.com/{GH_ORG}/{GH_REPO}.git"
-
-        if os.path.isdir(repo_path):
-            run("git fetch --tags --force", cwd=repo_path)
+        SVC_PATH = os.path.join(WORKDIR, "pulp-service")
+        if os.path.isdir(os.path.join(SVC_PATH, "pulp_service")):
+            print(f"Using existing pulp-service at {SVC_PATH}", file=sys.stderr)
+        elif os.path.isdir(os.path.join(SVC_PATH, ".git")):
+            run("git pull --ff-only", cwd=SVC_PATH)
         else:
-            run(f"git clone {clone_url} {repo_path}")
+            run(f"git clone --depth 1 https://github.com/pulp/pulp-service.git {SVC_PATH}")
 
-        # --- Phase 2: Resolve tags ---
-        new_tag = resolve_tag(repo_path, NEW_VER)
-        if not new_tag:
-            result = {
-                "package": PKG, "currentVersion": CUR_VER, "latestVersion": NEW_VER,
-                "error": f"Tag {NEW_VER} (or v{NEW_VER}) not found",
-                "patches": [],
-            }
+        # ── Phase 1: Parse CLAUDE.md ───────────────────────────────
+
+        claude_path = os.path.join(SVC_PATH, "images", "assets", "patches", "CLAUDE.md")
+        with open(claude_path) as f:
+            claude_content = f.read()
+
+        table_row = re.compile(
+            r'\|\s*`([^`]+)/`\s*\|'           # patch prefix
+            r'\s*\[([^\]]+)\]\(([^)]+)\)\s*\|' # repo name + URL
+            r'\s*(\S+)\s*\|'                   # PyPI package
+            r'\s*(\S+)\s*\|'                    # current version tag
+        )
+
+        packages = []
+        seen_repos = {}
+        for m in table_row.finditer(claude_content):
+            prefix = m.group(1)
+            gh_url = m.group(3)
+            pypi_pkg = m.group(4)
+            cur_ver = m.group(5)
+
+            if pypi_pkg == "(bundled)":
+                continue
+
+            parts = gh_url.rstrip('/').split('/')
+            gh_org, gh_repo = parts[-2], parts[-1]
+
+            packages.append({
+                "package": pypi_pkg,
+                "ghOrg": gh_org,
+                "ghRepo": gh_repo,
+                "patchDirPrefix": prefix,
+                "currentVersion": cur_ver,
+            })
+
+        print(f"Parsed {len(packages)} packages from CLAUDE.md", file=sys.stderr)
+
+        # ── Phase 2: Query PyPI for newer versions ─────────────────
+
+        packages_to_upgrade = []
+        for pkg in packages:
+            try:
+                url = f"https://pypi.org/pypi/{pkg['package']}/json"
+                resp = urllib.request.urlopen(url, timeout=15)
+                data = json.loads(resp.read())
+                latest = data["info"]["version"]
+            except Exception as e:
+                print(f"WARNING: PyPI query failed for {pkg['package']}: {e}", file=sys.stderr)
+                continue
+
+            def ver_tuple(v):
+                return tuple(int(x) for x in re.findall(r'\d+', v))
+
+            if ver_tuple(latest) > ver_tuple(pkg['currentVersion']):
+                pkg['latestVersion'] = latest
+                packages_to_upgrade.append(pkg)
+                print(f"  {pkg['package']}: {pkg['currentVersion']} -> {latest}", file=sys.stderr)
+            else:
+                print(f"  {pkg['package']}: up to date ({pkg['currentVersion']})", file=sys.stderr)
+
+        if not packages_to_upgrade:
+            result = {"status": "all_up_to_date", "packages": []}
             print(json.dumps(result))
             sys.exit(0)
 
-        old_tag = resolve_tag(repo_path, CUR_VER)
-        reset_repo(repo_path, new_tag)
+        # ── Phase 3: Read Dockerfile patch list ────────────────────
 
-        # --- Phase 3: Find patches targeting this package (only those in Dockerfile) ---
-        patches_dir = os.path.join(SVC_PATH, "images", "assets", "patches")
-        patch_files = sorted(glob.glob(os.path.join(patches_dir, "*.patch")))
-
-        # Only consider patches that are referenced in the Dockerfile
+        dockerfile_path = os.path.join(SVC_PATH, "Dockerfile")
         dockerfile_ref_patches = set()
-        df_path = os.path.join(SVC_PATH, "Dockerfile")
-        if os.path.isfile(df_path):
-            with open(df_path) as df:
+        if os.path.isfile(dockerfile_path):
+            with open(dockerfile_path) as df:
                 for line in df:
                     m = re.search(r'patches/(\S+\.patch)', line)
                     if m:
                         dockerfile_ref_patches.add(m.group(1))
 
-        matching_patches = []
-        for pf in patch_files:
-            fname = os.path.basename(pf)
-            if fname not in dockerfile_ref_patches:
-                continue
-            with open(pf) as f:
-                content = f.read()
-            pat = rf"diff --git a/{re.escape(PATCH_PREFIX)}/"
-            if re.search(pat, content):
-                matching_patches.append({"filename": fname, "path": pf})
+        # ── Phase 4: Process each package ──────────────────────────
 
-        if not matching_patches:
-            result = {
-                "package": PKG, "currentVersion": CUR_VER, "latestVersion": NEW_VER,
-                "newTag": new_tag, "patches": [],
-                "summary": "No patches target this package",
-            }
-            print(json.dumps(result))
-            sys.exit(0)
+        all_results = []
 
-        print(f"Found {len(matching_patches)} patches for {PKG}", file=sys.stderr)
+        for pkg_info in packages_to_upgrade:
+            PKG = pkg_info['package']
+            CUR_VER = pkg_info['currentVersion']
+            NEW_VER = pkg_info['latestVersion']
+            GH_ORG = pkg_info['ghOrg']
+            GH_REPO = pkg_info['ghRepo']
+            PATCH_PREFIX = pkg_info['patchDirPrefix']
 
-        # --- Phase 4: Group patches, test, combine, and regenerate ---
-        patch_results = []
-        dockerfile_path = os.path.join(SVC_PATH, "Dockerfile")
-        groups = find_patch_groups(matching_patches, PATCH_PREFIX)
+            print(f"\nProcessing {PKG}: {CUR_VER} -> {NEW_VER}", file=sys.stderr)
 
-        for group in groups:
-            if len(group) == 1:
-                # --- Single patch: test independently and regenerate if needed ---
-                mp = group[0]
-                pf = mp["path"]
-                fname = mp["filename"]
-                reset_repo(repo_path, new_tag)
-
-                dry_run = run(f"patch --dry-run -p1 < {pf}", cwd=repo_path, check=False)
-                if dry_run.returncode == 0:
-                    patch_results.append({
-                        "filename": fname, "status": "applied",
-                        "details": "Applied cleanly",
-                    })
-                    continue
-
-                if not old_tag:
-                    patch_results.append({
-                        "filename": fname, "status": "failed",
-                        "details": f"Cannot regenerate: old tag {CUR_VER} not found",
-                    })
-                    continue
-
-                print(f"Regenerating {fname}...", file=sys.stderr)
-                new_diff, error = regenerate_patch(
-                    repo_path, old_tag, new_tag, pf, PATCH_PREFIX
-                )
-
-                if error and new_diff is None:
-                    patch_results.append({
-                        "filename": fname, "status": "conflicts",
-                        "details": f"Regeneration failed: {error}",
-                    })
-                    continue
-
-                if new_diff == "":
-                    print(f"  {fname}: upstreamed, deleting", file=sys.stderr)
-                    os.remove(pf)
-                    if os.path.isfile(dockerfile_path):
-                        with open(dockerfile_path) as df:
-                            dlines = df.readlines()
-                        with open(dockerfile_path, 'w') as df:
-                            for dl in dlines:
-                                if fname not in dl:
-                                    df.write(dl)
-                    patch_results.append({
-                        "filename": fname, "status": "upstreamed",
-                        "details": "Deleted — all changes present in new version",
-                    })
-                    continue
-
-                with open(pf) as f:
-                    original_content = f.read()
-                rebuilt = rebuild_patch_file(pf, PATCH_PREFIX, new_diff, original_content)
-                with open(pf, 'w') as f:
-                    f.write(rebuilt)
-
-                reset_repo(repo_path, new_tag)
-                verify = run(f"patch --dry-run -p1 < {pf}", cwd=repo_path, check=False)
-                if verify.returncode == 0:
-                    patch_results.append({
-                        "filename": fname, "status": "regenerated",
-                        "details": "Regenerated and verified clean",
-                    })
-                else:
-                    patch_results.append({
-                        "filename": fname, "status": "regen_verify_failed",
-                        "details": f"Regenerated but verify failed:\n{verify.stdout}\n{verify.stderr}",
-                    })
-
+            # Clone or update upstream repo
+            repo_path = os.path.join(WORKDIR, GH_REPO)
+            clone_url = f"https://github.com/{GH_ORG}/{GH_REPO}.git"
+            if os.path.isdir(repo_path):
+                run("git fetch --tags --force", cwd=repo_path)
             else:
-                # --- Multi-patch group: test each independently first ---
-                independent = []
-                needs_work = []
-                for mp in group:
-                    reset_repo(repo_path, new_tag)
-                    dry = run(f"patch --dry-run -p1 < {mp['path']}", cwd=repo_path, check=False)
-                    if dry.returncode == 0:
-                        independent.append(mp)
-                    else:
-                        needs_work.append(mp)
+                run(f"git clone {clone_url} {repo_path}")
 
-                if not needs_work:
-                    # All patches in group apply independently
-                    for mp in independent:
-                        patch_results.append({
-                            "filename": mp["filename"], "status": "applied",
-                            "details": "Applied cleanly",
-                        })
+            run(f"git config user.email upgrade@local", cwd=repo_path, check=False)
+            run(f"git config user.name upgrade", cwd=repo_path, check=False)
+
+            new_tag = resolve_tag(repo_path, NEW_VER)
+            if not new_tag:
+                all_results.append({
+                    "package": PKG, "currentVersion": CUR_VER, "latestVersion": NEW_VER,
+                    "error": f"Tag {NEW_VER} (or v{NEW_VER}) not found",
+                    "patches": [],
+                })
+                continue
+
+            old_tag = resolve_tag(repo_path, CUR_VER)
+            reset_repo(repo_path, new_tag)
+
+            # Find matching patches (only Dockerfile-referenced ones)
+            patches_dir = os.path.join(SVC_PATH, "images", "assets", "patches")
+            patch_files = sorted(glob.glob(os.path.join(patches_dir, "*.patch")))
+            matching_patches = []
+            for pf in patch_files:
+                fname = os.path.basename(pf)
+                if fname not in dockerfile_ref_patches:
                     continue
+                with open(pf) as f:
+                    content = f.read()
+                if re.search(rf"diff --git a/{re.escape(PATCH_PREFIX)}/", content):
+                    matching_patches.append({"filename": fname, "path": pf})
 
-                # Check if needs_work patches succeed after independent ones
-                # (i.e., they depend on the independent patches)
-                depends_on_independent = []
-                truly_broken = []
-                if independent:
+            if not matching_patches:
+                all_results.append({
+                    "package": PKG, "currentVersion": CUR_VER, "latestVersion": NEW_VER,
+                    "newTag": new_tag, "patches": [],
+                    "summary": "No patches target this package",
+                })
+                continue
+
+            print(f"  Found {len(matching_patches)} patches", file=sys.stderr)
+
+            # ── Group, test, combine, regenerate ───────────────────
+            patch_results = []
+            groups = find_patch_groups(matching_patches, PATCH_PREFIX)
+
+            for group in groups:
+                if len(group) == 1:
+                    mp = group[0]
+                    pf, fname = mp["path"], mp["filename"]
                     reset_repo(repo_path, new_tag)
-                    for mp in independent:
-                        run(f"patch --no-backup-if-mismatch -p1 < {mp['path']}", cwd=repo_path, check=False)
-                        run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
-                    for mp in needs_work:
-                        dry = run(f"patch --dry-run -p1 < {mp['path']}", cwd=repo_path, check=False)
-                        if dry.returncode == 0:
-                            depends_on_independent.append(mp)
-                        else:
-                            truly_broken.append(mp)
-                else:
-                    truly_broken = needs_work
-
-                if depends_on_independent:
-                    # These patches depend on independent ones — combine each
-                    # dependent with its independent prerequisite(s)
-                    to_combine = independent + depends_on_independent
-                    group_names = [mp["filename"] for mp in to_combine]
-                    print(f"Combining group: {', '.join(group_names)}", file=sys.stderr)
-
-                    combined_diff, error = combine_patch_group(
-                        repo_path, old_tag, new_tag, to_combine, PATCH_PREFIX
-                    )
-
-                    if error and combined_diff is None:
-                        for mp in independent:
-                            patch_results.append({
-                                "filename": mp["filename"], "status": "applied",
-                                "details": "Applied cleanly",
-                            })
-                        for mp in depends_on_independent:
-                            patch_results.append({
-                                "filename": mp["filename"], "status": "conflicts",
-                                "details": f"Cannot combine: {error}",
-                            })
-                    elif combined_diff == "":
-                        for mp in to_combine:
-                            fname = mp["filename"]
-                            if os.path.isfile(mp["path"]):
-                                os.remove(mp["path"])
-                            if os.path.isfile(dockerfile_path):
-                                with open(dockerfile_path) as df:
-                                    dlines = df.readlines()
-                                with open(dockerfile_path, 'w') as df:
-                                    for dl in dlines:
-                                        if fname not in dl:
-                                            df.write(dl)
-                            patch_results.append({
-                                "filename": fname, "status": "upstreamed",
-                                "details": "Deleted — all changes present in new version",
-                            })
-                    else:
-                        first = to_combine[0]
-                        with open(first["path"]) as f:
-                            original_content = f.read()
-                        rebuilt = rebuild_patch_file(
-                            first["path"], PATCH_PREFIX, combined_diff, original_content
-                        )
-                        with open(first["path"], 'w') as f:
-                            f.write(rebuilt)
-
-                        for mp in to_combine[1:]:
-                            fname = mp["filename"]
-                            if os.path.isfile(mp["path"]):
-                                os.remove(mp["path"])
-                            if os.path.isfile(dockerfile_path):
-                                with open(dockerfile_path) as df:
-                                    dlines = df.readlines()
-                                with open(dockerfile_path, 'w') as df:
-                                    for dl in dlines:
-                                        if fname not in dl:
-                                            df.write(dl)
-
-                        reset_repo(repo_path, new_tag)
-                        verify = run(
-                            f"patch --dry-run -p1 < {first['path']}",
-                            cwd=repo_path, check=False
-                        )
-
-                        combined_names = " + ".join(group_names)
-                        if verify.returncode == 0:
-                            patch_results.append({
-                                "filename": first["filename"],
-                                "status": "combined",
-                                "details": f"Combined from: {combined_names}",
-                                "combined_from": group_names,
-                            })
-                        else:
-                            patch_results.append({
-                                "filename": first["filename"],
-                                "status": "combined_verify_failed",
-                                "details": f"Combined from {combined_names} but verify failed:\n{verify.stdout}\n{verify.stderr}",
-                                "combined_from": group_names,
-                            })
-                else:
-                    # No dependencies — independent patches stay separate
-                    for mp in independent:
-                        patch_results.append({
-                            "filename": mp["filename"], "status": "applied",
-                            "details": "Applied cleanly",
-                        })
-
-                # Handle truly broken patches individually
-                for mp in truly_broken:
-                    pf = mp["path"]
-                    fname = mp["filename"]
-                    if not old_tag:
-                        patch_results.append({
-                            "filename": fname, "status": "failed",
-                            "details": f"Cannot regenerate: old tag {CUR_VER} not found",
-                        })
+                    dry = run(f"patch --dry-run -p1 < {pf}", cwd=repo_path, check=False)
+                    if dry.returncode == 0:
+                        patch_results.append({"filename": fname, "status": "applied", "details": "Applied cleanly"})
                         continue
-                    print(f"Regenerating {fname}...", file=sys.stderr)
-                    new_diff, error = regenerate_patch(
-                        repo_path, old_tag, new_tag, pf, PATCH_PREFIX
-                    )
+                    if not old_tag:
+                        patch_results.append({"filename": fname, "status": "failed", "details": f"Cannot regenerate: old tag {CUR_VER} not found"})
+                        continue
+                    print(f"  Regenerating {fname}...", file=sys.stderr)
+                    new_diff, error = regenerate_patch(repo_path, old_tag, new_tag, pf, PATCH_PREFIX)
                     if error and new_diff is None:
-                        patch_results.append({
-                            "filename": fname, "status": "conflicts",
-                            "details": f"Regeneration failed: {error}",
-                        })
-                    elif new_diff == "":
-                        print(f"  {fname}: upstreamed, deleting", file=sys.stderr)
+                        patch_results.append({"filename": fname, "status": "conflicts", "details": f"Regeneration failed: {error}"})
+                        continue
+                    if new_diff == "":
                         os.remove(pf)
                         if os.path.isfile(dockerfile_path):
-                            with open(dockerfile_path) as df:
-                                dlines = df.readlines()
+                            with open(dockerfile_path) as df: dlines = df.readlines()
                             with open(dockerfile_path, 'w') as df:
                                 for dl in dlines:
-                                    if fname not in dl:
-                                        df.write(dl)
-                        patch_results.append({
-                            "filename": fname, "status": "upstreamed",
-                            "details": "Deleted — all changes present in new version",
-                        })
-                    else:
-                        with open(pf) as f:
-                            original_content = f.read()
-                        rebuilt = rebuild_patch_file(pf, PATCH_PREFIX, new_diff, original_content)
-                        with open(pf, 'w') as f:
-                            f.write(rebuilt)
+                                    if fname not in dl: df.write(dl)
+                        patch_results.append({"filename": fname, "status": "upstreamed", "details": "Deleted"})
+                        continue
+                    with open(pf) as f: orig = f.read()
+                    with open(pf, 'w') as f: f.write(rebuild_patch_file(pf, PATCH_PREFIX, new_diff, orig))
+                    reset_repo(repo_path, new_tag)
+                    v = run(f"patch --dry-run -p1 < {pf}", cwd=repo_path, check=False)
+                    patch_results.append({
+                        "filename": fname,
+                        "status": "regenerated" if v.returncode == 0 else "regen_verify_failed",
+                        "details": "Regenerated and verified clean" if v.returncode == 0 else f"Verify failed:\n{v.stdout}\n{v.stderr}",
+                    })
+                else:
+                    independent, needs_work = [], []
+                    for mp in group:
                         reset_repo(repo_path, new_tag)
-                        verify = run(f"patch --dry-run -p1 < {pf}", cwd=repo_path, check=False)
-                        if verify.returncode == 0:
-                            patch_results.append({
-                                "filename": fname, "status": "regenerated",
-                                "details": "Regenerated and verified clean",
-                            })
+                        dry = run(f"patch --dry-run -p1 < {mp['path']}", cwd=repo_path, check=False)
+                        (independent if dry.returncode == 0 else needs_work).append(mp)
+                    if not needs_work:
+                        for mp in independent:
+                            patch_results.append({"filename": mp["filename"], "status": "applied", "details": "Applied cleanly"})
+                        continue
+                    depends, truly_broken = [], []
+                    if independent:
+                        reset_repo(repo_path, new_tag)
+                        for mp in independent:
+                            run(f"patch --no-backup-if-mismatch -p1 < {mp['path']}", cwd=repo_path, check=False)
+                            run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
+                        for mp in needs_work:
+                            dry = run(f"patch --dry-run -p1 < {mp['path']}", cwd=repo_path, check=False)
+                            (depends if dry.returncode == 0 else truly_broken).append(mp)
+                    else:
+                        truly_broken = needs_work
+                    if depends:
+                        to_combine = independent + depends
+                        names = [mp["filename"] for mp in to_combine]
+                        print(f"  Combining: {', '.join(names)}", file=sys.stderr)
+                        cd, err = combine_patch_group(repo_path, old_tag, new_tag, to_combine, PATCH_PREFIX)
+                        if err and cd is None:
+                            for mp in independent:
+                                patch_results.append({"filename": mp["filename"], "status": "applied", "details": "Applied cleanly"})
+                            for mp in depends:
+                                patch_results.append({"filename": mp["filename"], "status": "conflicts", "details": f"Cannot combine: {err}"})
+                        elif cd == "":
+                            for mp in to_combine:
+                                fn = mp["filename"]
+                                if os.path.isfile(mp["path"]): os.remove(mp["path"])
+                                if os.path.isfile(dockerfile_path):
+                                    with open(dockerfile_path) as df: dl = df.readlines()
+                                    with open(dockerfile_path, 'w') as df:
+                                        for l in dl:
+                                            if fn not in l: df.write(l)
+                                patch_results.append({"filename": fn, "status": "upstreamed", "details": "Deleted"})
                         else:
+                            first = to_combine[0]
+                            with open(first["path"]) as f: orig = f.read()
+                            with open(first["path"], 'w') as f: f.write(rebuild_patch_file(first["path"], PATCH_PREFIX, cd, orig))
+                            for mp in to_combine[1:]:
+                                fn = mp["filename"]
+                                if os.path.isfile(mp["path"]): os.remove(mp["path"])
+                                if os.path.isfile(dockerfile_path):
+                                    with open(dockerfile_path) as df: dl = df.readlines()
+                                    with open(dockerfile_path, 'w') as df:
+                                        for l in dl:
+                                            if fn not in l: df.write(l)
+                            reset_repo(repo_path, new_tag)
+                            v = run(f"patch --dry-run -p1 < {first['path']}", cwd=repo_path, check=False)
+                            cn = " + ".join(names)
                             patch_results.append({
-                                "filename": fname, "status": "regen_verify_failed",
-                                "details": f"Regenerated but verify failed:\n{verify.stdout}\n{verify.stderr}",
+                                "filename": first["filename"],
+                                "status": "combined" if v.returncode == 0 else "combined_verify_failed",
+                                "details": f"Combined from: {cn}" if v.returncode == 0 else f"Combined but verify failed",
+                                "combined_from": names,
+                            })
+                    else:
+                        for mp in independent:
+                            patch_results.append({"filename": mp["filename"], "status": "applied", "details": "Applied cleanly"})
+                    for mp in truly_broken:
+                        pf, fname = mp["path"], mp["filename"]
+                        if not old_tag:
+                            patch_results.append({"filename": fname, "status": "failed", "details": f"Cannot regenerate: old tag not found"})
+                            continue
+                        print(f"  Regenerating {fname}...", file=sys.stderr)
+                        nd, err = regenerate_patch(repo_path, old_tag, new_tag, pf, PATCH_PREFIX)
+                        if err and nd is None:
+                            patch_results.append({"filename": fname, "status": "conflicts", "details": f"Regeneration failed: {err}"})
+                        elif nd == "":
+                            os.remove(pf)
+                            if os.path.isfile(dockerfile_path):
+                                with open(dockerfile_path) as df: dl = df.readlines()
+                                with open(dockerfile_path, 'w') as df:
+                                    for l in dl:
+                                        if fname not in l: df.write(l)
+                            patch_results.append({"filename": fname, "status": "upstreamed", "details": "Deleted"})
+                        else:
+                            with open(pf) as f: orig = f.read()
+                            with open(pf, 'w') as f: f.write(rebuild_patch_file(pf, PATCH_PREFIX, nd, orig))
+                            reset_repo(repo_path, new_tag)
+                            v = run(f"patch --dry-run -p1 < {pf}", cwd=repo_path, check=False)
+                            patch_results.append({
+                                "filename": fname,
+                                "status": "regenerated" if v.returncode == 0 else "regen_verify_failed",
+                                "details": "Regenerated and verified clean" if v.returncode == 0 else f"Verify failed",
                             })
 
+            applied = sum(1 for p in patch_results if p["status"] == "applied")
+            regen = sum(1 for p in patch_results if p["status"] == "regenerated")
+            comb = sum(1 for p in patch_results if p["status"] == "combined")
+            ups = sum(1 for p in patch_results if p["status"] == "upstreamed")
+            conf = sum(1 for p in patch_results if p["status"] == "conflicts")
+            vf = sum(1 for p in patch_results if p["status"] in ("regen_verify_failed", "combined_verify_failed"))
 
-        applied = sum(1 for p in patch_results if p["status"] == "applied")
-        regenerated = sum(1 for p in patch_results if p["status"] == "regenerated")
-        combined = sum(1 for p in patch_results if p["status"] == "combined")
-        upstreamed = sum(1 for p in patch_results if p["status"] == "upstreamed")
-        conflicts = sum(1 for p in patch_results if p["status"] == "conflicts")
-        verify_fail = sum(1 for p in patch_results if p["status"] in ("regen_verify_failed", "combined_verify_failed"))
+            all_results.append({
+                "package": PKG, "currentVersion": CUR_VER, "latestVersion": NEW_VER,
+                "newTag": new_tag, "oldTag": old_tag or "not_found",
+                "patches": patch_results,
+                "summary": f"{len(patch_results)} patches: {applied} applied, {regen} regenerated, {comb} combined, {ups} upstreamed, {conf} conflicts, {vf} verify-failed",
+            })
 
-        result = {
-            "package": PKG, "currentVersion": CUR_VER, "latestVersion": NEW_VER,
-            "newTag": new_tag, "oldTag": old_tag or "not_found",
-            "repoPath": repo_path,
-            "patches": patch_results,
-            "summary": (
-                f"{len(patch_results)} patches: "
-                f"{applied} applied, {regenerated} regenerated, "
-                f"{combined} combined, {upstreamed} upstreamed, "
-                f"{conflicts} conflicts, {verify_fail} verify-failed"
-            ),
-        }
-
-        print(json.dumps(result))
+        print(json.dumps({"packages": all_results}))
         PYEOF
       timeout: 600000
       ignoreExitCode: true
-      env:
-        PKG_NAME: ${{ inputs.package }}
-        GH_ORG: ${{ inputs.ghOrg }}
-        GH_REPO: ${{ inputs.ghRepo }}
-        PATCH_PREFIX: ${{ inputs.patchDirPrefix }}
-        INITIAL_VERSION: ${{ inputs.initialVersion }}
-        FINAL_VERSION: ${{ inputs.finalVersion }}
-        SVC_PATH: ${{ inputs.pulpServicePath }}

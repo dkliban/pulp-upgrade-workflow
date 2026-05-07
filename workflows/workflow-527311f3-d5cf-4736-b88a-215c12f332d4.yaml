@@ -1,48 +1,18 @@
 id: 527311f3-d5cf-4736-b88a-215c12f332d4
 name: pulp-upgrade-check
 description: >-
-  Validate and regenerate pulp-service patches against new upstream versions.
-  Accepts explicit initial and final version lists. Clones upstream repos,
-  checks out the final version tag, tests each patch, and automatically
-  regenerates, combines, or deletes patches as needed.
+  Clones pulp-service, reads CLAUDE.md to discover patched packages and
+  their current versions, queries PyPI for newer versions, then clones
+  upstream repos and validates/regenerates/combines patches automatically.
 version: 1
 tags: {}
-inputs:
-  properties:
-    pulpServicePath:
-      type: string
-      description: Path to the pulp-service repository
-    packages:
-      type: array
-      description: >-
-        List of packages with their GitHub coordinates and version range.
-        Each entry needs: package, ghOrg, ghRepo, patchDirPrefix,
-        initialVersion, finalVersion.
-  required:
-    - pulpServicePath
-    - packages
 jobs:
-  - name: process-packages
-    description: Clone each upstream repo and validate/regenerate patches
+  - name: upgrade
+    description: Discover packages, check PyPI, and process all patches
     steps:
-      - name: process-${{ self.pkg.package }}
-        description: Process patches for a single package
-        forEach:
-          item: pkg
-          in: ${{ inputs.packages }}
+      - name: upgrade-patches
+        description: Run the full upgrade pipeline
         task:
           type: model_method
-          modelIdOrName: process-package
+          modelIdOrName: upgrade-patches
           methodName: execute
-          inputs:
-            package: ${{ self.pkg.package }}
-            ghOrg: ${{ self.pkg.ghOrg }}
-            ghRepo: ${{ self.pkg.ghRepo }}
-            patchDirPrefix: ${{ self.pkg.patchDirPrefix }}
-            initialVersion: ${{ self.pkg.initialVersion }}
-            finalVersion: ${{ self.pkg.finalVersion }}
-            pulpServicePath: ${{ inputs.pulpServicePath }}
-        dataOutputOverrides:
-          - specName: result
-            vary:
-              - package
