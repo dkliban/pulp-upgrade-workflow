@@ -221,15 +221,16 @@ methods:
                 return "", "all changes upstreamed (combined diff is empty)"
             return combined_diff, None
 
-        # ── Phase 0: Clone/reuse pulp-service ──────────────────────
+        # ── Phase 0: Clone pulp-service from upstream ──────────────
 
         SVC_PATH = os.path.join(WORKDIR, "pulp-service")
-        if os.path.isdir(os.path.join(SVC_PATH, "pulp_service")):
-            print(f"Using existing pulp-service at {SVC_PATH}", file=sys.stderr)
-        elif os.path.isdir(os.path.join(SVC_PATH, ".git")):
-            run("git pull --ff-only", cwd=SVC_PATH)
+        if os.path.isdir(os.path.join(SVC_PATH, ".git")):
+            run("git fetch origin", cwd=SVC_PATH)
+            run("git checkout -f main", cwd=SVC_PATH)
+            run("git reset --hard origin/main", cwd=SVC_PATH)
+            run("git clean -fdx", cwd=SVC_PATH)
         else:
-            run(f"git clone --depth 1 https://github.com/pulp/pulp-service.git {SVC_PATH}")
+            run(f"git clone https://github.com/pulp/pulp-service.git {SVC_PATH}")
 
         # ── Phase 1: Parse CLAUDE.md ───────────────────────────────
 
