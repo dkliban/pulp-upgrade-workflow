@@ -705,8 +705,9 @@ methods:
                 if len(group) == 1:
                     mp = group[0]
                     pf, fname = mp["path"], mp["filename"]
-                    ok, syntax_err = verify_patch_syntax(repo_path, new_tag, pf)
-                    if ok:
+                    reset_repo(repo_path, new_tag)
+                    dry = run(f"patch --dry-run -p1 < {pf}", cwd=repo_path, check=False)
+                    if dry.returncode == 0:
                         patch_results.append({"filename": fname, "status": "applied", "details": "Applied cleanly"})
                         continue
                     if not old_tag:
@@ -737,8 +738,9 @@ methods:
                 else:
                     independent, needs_work = [], []
                     for mp in group:
-                        ok, _ = verify_patch_syntax(repo_path, new_tag, mp['path'])
-                        (independent if ok else needs_work).append(mp)
+                        reset_repo(repo_path, new_tag)
+                        dry = run(f"patch --dry-run -p1 < {mp['path']}", cwd=repo_path, check=False)
+                        (independent if dry.returncode == 0 else needs_work).append(mp)
                     if not needs_work:
                         for mp in independent:
                             patch_results.append({"filename": mp["filename"], "status": "applied", "details": "Applied cleanly"})
