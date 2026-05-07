@@ -147,17 +147,54 @@ methods:
             return True, None
 
         def deduplicate_imports(content):
-            """Remove duplicate import lines while preserving order."""
-            seen = set()
+            """Remove duplicate import lines and names in parenthesized blocks."""
             lines = content.splitlines(True)
             result = []
+            seen_imports = set()
+            in_paren_import = False
+            paren_names = set()
+            paren_header = ""
+
             for line in lines:
                 stripped = line.strip()
-                if stripped.startswith(('import ', 'from ')) and not stripped.endswith('('):
-                    if stripped in seen:
+
+                # Track parenthesized import blocks: from X import (
+                if re.match(r'^from \S+ import \(', stripped):
+                    in_paren_import = True
+                    paren_header = stripped
+                    if paren_header in seen_imports:
+                        # Entire duplicate block — skip until closing )
+                        for line2 in lines[lines.index(line)+1:]:
+                            if ')' in line2:
+                                break
                         continue
-                    seen.add(stripped)
+                    seen_imports.add(paren_header)
+                    paren_names = set()
+                    result.append(line)
+                    continue
+
+                if in_paren_import:
+                    if ')' in stripped:
+                        in_paren_import = False
+                        result.append(line)
+                        continue
+                    # Deduplicate names within the block
+                    name = stripped.rstrip(',').strip()
+                    if name and not name.startswith('#'):
+                        if name in paren_names:
+                            continue
+                        paren_names.add(name)
+                    result.append(line)
+                    continue
+
+                # Single-line imports
+                if stripped.startswith(('import ', 'from ')) and '(' not in stripped:
+                    if stripped in seen_imports:
+                        continue
+                    seen_imports.add(stripped)
+
                 result.append(line)
+
             return ''.join(result)
 
         def fix_missing_names(merged_content, new_version_content):
@@ -484,6 +521,7 @@ methods:
                         with open(fpath) as fh:
                             content = fh.read()
                         resolved = resolve_conflict_markers(content, fpath)
+                        resolved = deduplicate_imports(resolved)
                         with open(fpath, 'w') as fh:
                             fh.write(resolved)
                         run(f"git add -- '{uf}'", cwd=repo_path, check=False)
@@ -511,6 +549,19 @@ methods:
                             tmp_path = tmp.name
                         run(f"git apply -p0 < {tmp_path}", cwd=repo_path, check=False)
                         os.unlink(tmp_path)
+            # Deduplicate imports in modified .py files before generating diff
+            modified = run("git diff --name-only", cwd=repo_path, check=False).stdout.strip()
+            for mf in modified.splitlines():
+                if mf.endswith('.py'):
+                    fp = os.path.join(repo_path, mf)
+                    if os.path.isfile(fp):
+                        with open(fp) as fh:
+                            content = fh.read()
+                        deduped = deduplicate_imports(content)
+                        if deduped != content:
+                            with open(fp, 'w') as fh:
+                                fh.write(deduped)
+
             combined_diff = run("git diff", cwd=repo_path, check=False).stdout
             reset_repo(repo_path, new_tag)
             if not combined_diff.strip():
