@@ -594,6 +594,10 @@ methods:
                     if pkg_def["package"] == pkg_name:
                         version_updates[pkg_def["patchDirPrefix"]] = new_ver
 
+        # pulp_file is bundled in pulpcore — keep its version in sync
+        if "pulpcore" in version_updates:
+            version_updates["pulp_file"] = version_updates["pulpcore"]
+
         # Update requirements.txt with new versions
         if version_updates:
             req_path = os.path.join(SVC_PATH, "pulp_service", "requirements.txt")
