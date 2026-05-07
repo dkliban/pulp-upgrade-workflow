@@ -104,6 +104,30 @@ methods:
 
             return union
 
+        def verify_patch_syntax(repo_path, new_tag, patch_path):
+            """Apply a patch and check that all modified .py files have valid syntax."""
+            reset_repo(repo_path, new_tag)
+            r = run(f"patch --dry-run -p1 < {patch_path}", cwd=repo_path, check=False)
+            if r.returncode != 0:
+                return False, f"patch does not apply: {r.stdout}"
+            run(f"patch --no-backup-if-mismatch -p1 < {patch_path}", cwd=repo_path, check=False)
+            run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
+            errors = []
+            with open(patch_path) as f:
+                content = f.read()
+            for m in re.finditer(r'diff --git a/(\S+\.py)\s', content):
+                py_file = os.path.join(repo_path, m.group(1))
+                if os.path.isfile(py_file):
+                    try:
+                        with open(py_file) as pf:
+                            compile(pf.read(), m.group(1), 'exec')
+                    except SyntaxError as e:
+                        errors.append(f"{m.group(1)}: {e}")
+            reset_repo(repo_path, new_tag)
+            if errors:
+                return False, "Syntax errors: " + "; ".join(errors)
+            return True, None
+
         def regenerate_patch(repo_path, old_tag, new_tag, patch_path, patch_prefix):
             with open(patch_path) as f:
                 full_content = f.read()
@@ -415,9 +439,8 @@ methods:
                 if len(group) == 1:
                     mp = group[0]
                     pf, fname = mp["path"], mp["filename"]
-                    reset_repo(repo_path, new_tag)
-                    dry = run(f"patch --dry-run -p1 < {pf}", cwd=repo_path, check=False)
-                    if dry.returncode == 0:
+                    ok, syntax_err = verify_patch_syntax(repo_path, new_tag, pf)
+                    if ok:
                         patch_results.append({"filename": fname, "status": "applied", "details": "Applied cleanly"})
                         continue
                     if not old_tag:
@@ -439,19 +462,17 @@ methods:
                         continue
                     with open(pf) as f: orig = f.read()
                     with open(pf, 'w') as f: f.write(rebuild_patch_file(pf, PATCH_PREFIX, new_diff, orig))
-                    reset_repo(repo_path, new_tag)
-                    v = run(f"patch --dry-run -p1 < {pf}", cwd=repo_path, check=False)
+                    ok, syntax_err = verify_patch_syntax(repo_path, new_tag, pf)
                     patch_results.append({
                         "filename": fname,
-                        "status": "regenerated" if v.returncode == 0 else "regen_verify_failed",
-                        "details": "Regenerated and verified clean" if v.returncode == 0 else f"Verify failed:\n{v.stdout}\n{v.stderr}",
+                        "status": "regenerated" if ok else "regen_verify_failed",
+                        "details": "Regenerated and verified clean" if ok else f"Verify failed: {syntax_err}",
                     })
                 else:
                     independent, needs_work = [], []
                     for mp in group:
-                        reset_repo(repo_path, new_tag)
-                        dry = run(f"patch --dry-run -p1 < {mp['path']}", cwd=repo_path, check=False)
-                        (independent if dry.returncode == 0 else needs_work).append(mp)
+                        ok, _ = verify_patch_syntax(repo_path, new_tag, mp['path'])
+                        (independent if ok else needs_work).append(mp)
                     if not needs_work:
                         for mp in independent:
                             patch_results.append({"filename": mp["filename"], "status": "applied", "details": "Applied cleanly"})
@@ -499,13 +520,12 @@ methods:
                                     with open(dockerfile_path, 'w') as df:
                                         for l in dl:
                                             if fn not in l: df.write(l)
-                            reset_repo(repo_path, new_tag)
-                            v = run(f"patch --dry-run -p1 < {first['path']}", cwd=repo_path, check=False)
+                            ok, syntax_err = verify_patch_syntax(repo_path, new_tag, first['path'])
                             cn = " + ".join(names)
                             patch_results.append({
                                 "filename": first["filename"],
-                                "status": "combined" if v.returncode == 0 else "combined_verify_failed",
-                                "details": f"Combined from: {cn}" if v.returncode == 0 else f"Combined but verify failed",
+                                "status": "combined" if ok else "combined_verify_failed",
+                                "details": f"Combined from: {cn}" if ok else f"Combined but verify failed: {syntax_err}",
                                 "combined_from": names,
                             })
                     else:
@@ -531,12 +551,11 @@ methods:
                         else:
                             with open(pf) as f: orig = f.read()
                             with open(pf, 'w') as f: f.write(rebuild_patch_file(pf, PATCH_PREFIX, nd, orig))
-                            reset_repo(repo_path, new_tag)
-                            v = run(f"patch --dry-run -p1 < {pf}", cwd=repo_path, check=False)
+                            ok, syntax_err = verify_patch_syntax(repo_path, new_tag, pf)
                             patch_results.append({
                                 "filename": fname,
-                                "status": "regenerated" if v.returncode == 0 else "regen_verify_failed",
-                                "details": "Regenerated and verified clean" if v.returncode == 0 else f"Verify failed",
+                                "status": "regenerated" if ok else "regen_verify_failed",
+                                "details": "Regenerated and verified clean" if ok else f"Verify failed: {syntax_err}",
                             })
 
             applied = sum(1 for p in patch_results if p["status"] == "applied")
