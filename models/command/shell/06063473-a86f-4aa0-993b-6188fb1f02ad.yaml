@@ -105,7 +105,7 @@ methods:
             return union
 
         def verify_patch_syntax(repo_path, new_tag, patch_path):
-            """Apply a patch and check that all modified .py files have valid syntax."""
+            """Apply a patch, fix missing imports, check syntax, update patch if needed."""
             reset_repo(repo_path, new_tag)
             r = run(f"patch --dry-run -p1 < {patch_path}", cwd=repo_path, check=False)
             if r.returncode != 0:
@@ -113,20 +113,231 @@ methods:
             run(f"patch --no-backup-if-mismatch -p1 < {patch_path}", cwd=repo_path, check=False)
             run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
             errors = []
+            patched_changed = False
             with open(patch_path) as f:
                 content = f.read()
             for m in re.finditer(r'diff --git a/(\S+\.py)\s', content):
                 py_file = os.path.join(repo_path, m.group(1))
-                if os.path.isfile(py_file):
-                    try:
-                        with open(py_file) as pf:
-                            compile(pf.read(), m.group(1), 'exec')
-                    except SyntaxError as e:
-                        errors.append(f"{m.group(1)}: {e}")
+                if not os.path.isfile(py_file):
+                    continue
+                with open(py_file) as pf:
+                    patched = pf.read()
+                try:
+                    compile(patched, m.group(1), 'exec')
+                except SyntaxError as e:
+                    errors.append(f"{m.group(1)}: {e}")
+                    continue
+                new_ver_content = run(f"git show {new_tag}:{m.group(1)}", cwd=repo_path, check=False).stdout
+                fixed = fix_missing_names(patched, new_ver_content)
+                if fixed != patched:
+                    with open(py_file, 'w') as pf:
+                        pf.write(fixed)
+                    patched_changed = True
+            if patched_changed:
+                new_diff = run("git diff", cwd=repo_path, check=False).stdout
+                if new_diff.strip():
+                    with open(patch_path) as f:
+                        orig_patch = f.read()
+                    rebuilt = rebuild_patch_file(patch_path, "", new_diff, "")
+                    with open(patch_path, 'w') as f:
+                        f.write(rebuilt)
             reset_repo(repo_path, new_tag)
             if errors:
                 return False, "Syntax errors: " + "; ".join(errors)
             return True, None
+
+        def deduplicate_imports(content):
+            """Remove duplicate import lines while preserving order."""
+            seen = set()
+            lines = content.splitlines(True)
+            result = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith(('import ', 'from ')) and not stripped.endswith('('):
+                    if stripped in seen:
+                        continue
+                    seen.add(stripped)
+                result.append(line)
+            return ''.join(result)
+
+        def fix_missing_names(merged_content, new_version_content):
+            """Re-add imports from new_version for names used but not imported."""
+            # Collect all imported names from the merged file
+            imported = set()
+            for m in re.finditer(r'^import (\w+)', merged_content, re.MULTILINE):
+                imported.add(m.group(1))
+            for m in re.finditer(r'^from \S+ import (.+)', merged_content, re.MULTILINE):
+                for name in re.split(r'[,\s]+', m.group(1)):
+                    name = name.strip().rstrip(')')
+                    if name and name != '#':
+                        imported.add(name)
+
+            # Collect all imported names from the new version
+            new_imports = {}
+            for m in re.finditer(r'^(import \w+)', new_version_content, re.MULTILINE):
+                name = m.group(1).split()[-1]
+                new_imports[name] = m.group(1)
+            # Handle both single-line and multi-line from...import
+            for m in re.finditer(r'^(from \S+ import) \(([^)]+)\)', new_version_content, re.MULTILINE | re.DOTALL):
+                prefix = m.group(1).strip()
+                for name in re.split(r'[,\s]+', m.group(2)):
+                    name = name.strip()
+                    if name and not name.startswith('#'):
+                        new_imports[name] = prefix
+            for m in re.finditer(r'^(from \S+ import) (\w+)', new_version_content, re.MULTILINE):
+                prefix = m.group(1).strip()
+                name = m.group(2).strip()
+                if name:
+                    new_imports[name] = prefix
+
+            # Find names used in the code but not imported
+            lines = merged_content.splitlines()
+            missing_imports = []
+            for name, imp_line in new_imports.items():
+                if name not in imported:
+                    pattern = re.compile(r'\b' + re.escape(name) + r'\b')
+                    for line in lines:
+                        stripped = line.strip()
+                        if stripped.startswith(('import ', 'from ', '#')):
+                            continue
+                        # Skip string literals
+                        code_part = re.sub(r'(["\']).*?\1', '', line)
+                        if pattern.search(code_part):
+                            if imp_line.startswith('import '):
+                                missing_imports.append(imp_line + '\n')
+                            else:
+                                # For 'from X import' style, add the name to
+                                # the existing import block if present
+                                missing_imports.append(('from_name', name, imp_line))
+                            break
+
+            if missing_imports:
+                result_lines = merged_content.splitlines(True)
+                # Handle 'from X import' additions by inserting into existing blocks
+                from_names = [(n, p) for item in missing_imports if isinstance(item, tuple) for _, n, p in [item]]
+                plain_imports = [item for item in missing_imports if isinstance(item, str)]
+                for name, prefix in from_names:
+                    # Find the matching 'from ... import (' block and add the name
+                    module = re.match(r'from (\S+) import', prefix)
+                    if not module:
+                        continue
+                    mod = module.group(1)
+                    for i, line in enumerate(result_lines):
+                        if re.match(rf'from {re.escape(mod)} import \(', line.strip()):
+                            # Insert name after the opening line
+                            result_lines.insert(i + 1, f'    {name},\n')
+                            break
+
+                # Handle plain 'import X' additions
+                if plain_imports:
+                    insert_idx = 0
+                    for i, line in enumerate(result_lines):
+                        stripped = line.strip()
+                        if not stripped or stripped.startswith('#'):
+                            continue
+                        if not line[0].isspace() and stripped.startswith(('import ', 'from ')):
+                            insert_idx = i + 1
+                        elif not line[0].isspace() and insert_idx > 0:
+                            break
+                    for imp in plain_imports:
+                        result_lines.insert(insert_idx, imp)
+                        insert_idx += 1
+
+                return ''.join(result_lines)
+
+            return merged_content
+
+        def merge_file_strategy(repo_path, old_tag, new_tag, patch_path, patch_prefix):
+            """Per-file 3-way merge: apply patch at old tag, merge result into new tag."""
+            with open(patch_path) as f:
+                full_content = f.read()
+            filtered = filter_patch_for_prefix(full_content, patch_prefix)
+            if not filtered.strip():
+                return None, "no hunks for this package"
+
+            # Get list of files the filtered patch modifies
+            files = []
+            for m in re.finditer(r'diff --git a/(\S+)', filtered):
+                files.append(m.group(1))
+            if not files:
+                return None, "no files found in filtered patch"
+
+            # Apply patch at old tag to get the "patched old" versions
+            reset_repo(repo_path, old_tag)
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as tmp:
+                tmp.write(filtered)
+                tmp_path = tmp.name
+            r = run(f"patch --no-backup-if-mismatch -p1 < {tmp_path}", cwd=repo_path, check=False)
+            os.unlink(tmp_path)
+            if r.returncode != 0:
+                reset_repo(repo_path, new_tag)
+                return None, f"patch does not apply at old tag: {r.stderr}"
+            run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
+
+            # Save patched old versions
+            patched_old = {}
+            for f in files:
+                fp = os.path.join(repo_path, f)
+                if os.path.isfile(fp):
+                    with open(fp) as fh:
+                        patched_old[f] = fh.read()
+
+            # For each file, do a 3-way merge
+            reset_repo(repo_path, new_tag)
+            all_ok = True
+            for f in files:
+                if f not in patched_old:
+                    continue
+                fp = os.path.join(repo_path, f)
+                if not os.path.isfile(fp):
+                    with open(fp, 'w') as fh:
+                        fh.write(patched_old[f])
+                    continue
+
+                base_content = run(f"git show {old_tag}:{f}", cwd=repo_path, check=False).stdout
+                new_content = run(f"git show {new_tag}:{f}", cwd=repo_path, check=False).stdout
+
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.base', delete=False) as bf:
+                    bf.write(base_content)
+                    base_path = bf.name
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.other', delete=False) as of:
+                    of.write(patched_old[f])
+                    other_path = of.name
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.current', delete=False) as cf:
+                    cf.write(new_content)
+                    current_path = cf.name
+
+                run(f"git merge-file --union {current_path} {base_path} {other_path}", cwd=repo_path, check=False)
+
+                with open(current_path) as fh:
+                    merged = fh.read()
+
+                os.unlink(base_path)
+                os.unlink(other_path)
+                os.unlink(current_path)
+
+                merged = deduplicate_imports(merged)
+                merged = fix_missing_names(merged, new_content)
+
+                if f.endswith('.py'):
+                    try:
+                        compile(merged, f, 'exec')
+                    except SyntaxError:
+                        all_ok = False
+
+                with open(fp, 'w') as fh:
+                    fh.write(merged)
+
+            if not all_ok:
+                reset_repo(repo_path, new_tag)
+                return None, "merge-file produced invalid syntax after dedup"
+
+            new_diff = run("git diff", cwd=repo_path, check=False).stdout
+            reset_repo(repo_path, new_tag)
+
+            if not new_diff.strip():
+                return "", "upstreamed (no diff after merge-file)"
+            return new_diff, None
 
         def regenerate_patch(repo_path, old_tag, new_tag, patch_path, patch_prefix):
             with open(patch_path) as f:
@@ -138,27 +349,38 @@ methods:
                 tmp.write(filtered)
                 tmp_path = tmp.name
             try:
+                # Strategy 1: fuzz at new version
                 reset_repo(repo_path, new_tag)
                 fuzz_r = run(f"patch --no-backup-if-mismatch -p1 --fuzz=3 < {tmp_path}", cwd=repo_path, check=False)
                 if fuzz_r.returncode == 0:
                     run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
-                    new_diff = run("git diff", cwd=repo_path, check=False).stdout
-                    reset_repo(repo_path, new_tag)
-                    if not new_diff.strip():
+                    syntax_ok = True
+                    for m in re.finditer(r'diff --git a/(\S+\.py)\s', filtered):
+                        fp = os.path.join(repo_path, m.group(1))
+                        if os.path.isfile(fp):
+                            try:
+                                with open(fp) as fh: compile(fh.read(), m.group(1), 'exec')
+                            except SyntaxError:
+                                syntax_ok = False
+                                break
+                    if syntax_ok:
+                        new_diff = run("git diff", cwd=repo_path, check=False).stdout
+                        reset_repo(repo_path, new_tag)
+                        if not new_diff.strip():
+                            os.unlink(tmp_path)
+                            return "", "upstreamed (fuzz apply produced no diff)"
                         os.unlink(tmp_path)
-                        return "", "upstreamed (fuzz apply produced no diff)"
-                    os.unlink(tmp_path)
-                    return new_diff, None
+                        return new_diff, None
+
+                # Strategy 2: git apply --3way
                 reset_repo(repo_path, new_tag)
                 run(f"git apply --3way -p1 < {tmp_path}", cwd=repo_path, check=False)
                 os.unlink(tmp_path)
                 unmerged = run("git diff --name-only --diff-filter=U", cwd=repo_path, check=False).stdout.strip()
                 if unmerged:
-                    resolved_all = True
                     for uf in unmerged.splitlines():
                         fpath = os.path.join(repo_path, uf)
                         if not os.path.isfile(fpath):
-                            resolved_all = False
                             continue
                         with open(fpath) as fh:
                             content = fh.read()
@@ -166,14 +388,25 @@ methods:
                         with open(fpath, 'w') as fh:
                             fh.write(resolved)
                         run(f"git add -- '{uf}'", cwd=repo_path, check=False)
-                    if not resolved_all:
-                        reset_repo(repo_path, new_tag)
-                        return None, f"could not resolve conflicts in: {unmerged}"
-                new_diff = run("git diff HEAD", cwd=repo_path, check=False).stdout
+                syntax_ok = True
+                for m in re.finditer(r'diff --git a/(\S+\.py)\s', filtered):
+                    fp = os.path.join(repo_path, m.group(1))
+                    if os.path.isfile(fp):
+                        try:
+                            with open(fp) as fh: compile(fh.read(), m.group(1), 'exec')
+                        except SyntaxError:
+                            syntax_ok = False
+                            break
+                if syntax_ok:
+                    new_diff = run("git diff HEAD", cwd=repo_path, check=False).stdout
+                    reset_repo(repo_path, new_tag)
+                    if not new_diff.strip():
+                        return "", "upstreamed (no diff after 3way merge)"
+                    return new_diff, None
+
+                # Strategy 3: per-file merge with deduplication
                 reset_repo(repo_path, new_tag)
-                if not new_diff.strip():
-                    return "", "upstreamed (no diff after 3way merge)"
-                return new_diff, None
+                return merge_file_strategy(repo_path, old_tag, new_tag, patch_path, patch_prefix)
             except Exception as e:
                 reset_repo(repo_path, new_tag)
                 return None, str(e)
