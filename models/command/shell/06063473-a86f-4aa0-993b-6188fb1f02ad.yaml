@@ -513,6 +513,95 @@ methods:
                 "summary": f"{len(patch_results)} patches: {applied} applied, {regen} regenerated, {comb} combined, {ups} upstreamed, {conf} conflicts, {vf} verify-failed",
             })
 
+        # ── Phase 5: Update CLAUDE.md ──────────────────────────────
+
+        deleted_patches = set()
+        combined_into = {}
+        version_updates = {}
+
+        for pkg_result in all_results:
+            pkg_name = pkg_result.get("package", "")
+            new_ver = pkg_result.get("latestVersion", "")
+            for p in pkg_result.get("patches", []):
+                if p["status"] == "upstreamed":
+                    deleted_patches.add(p["filename"])
+                elif p["status"] in ("combined", "combined_verify_failed"):
+                    survivor = p["filename"]
+                    for absorbed in p.get("combined_from", [])[1:]:
+                        deleted_patches.add(absorbed)
+                        combined_into.setdefault(survivor, []).append(absorbed)
+            if new_ver and pkg_result.get("patches"):
+                for pkg_def in packages_to_upgrade:
+                    if pkg_def["package"] == pkg_name:
+                        version_updates[pkg_def["patchDirPrefix"]] = new_ver
+
+        if deleted_patches or combined_into or version_updates:
+            with open(claude_path) as f:
+                lines = f.readlines()
+
+            new_lines = []
+            skip_section = False
+            current_patch_name = None
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+
+                # Update version tags in the upstream repositories table
+                if line.startswith("| `") and "`" in line:
+                    for prefix, new_ver in version_updates.items():
+                        pat = re.compile(
+                            r'(\|\s*`' + re.escape(prefix) + r'/`\s*\|.*\|\s*)\S+(\s*\|)\s*$'
+                        )
+                        m = pat.match(line)
+                        if m:
+                            line = m.group(1) + new_ver + m.group(2) + "\n"
+                            break
+
+                # Detect patch section headers
+                section_match = re.match(r'^### (\d{4})\s', line)
+                if section_match:
+                    patch_num = section_match.group(1)
+                    matching_deleted = [
+                        d for d in deleted_patches if d.startswith(patch_num + "-")
+                    ]
+                    if matching_deleted:
+                        skip_section = True
+                        i += 1
+                        continue
+                    else:
+                        skip_section = False
+                        current_patch_name = None
+                        for fn in combined_into:
+                            if fn.startswith(patch_num + "-"):
+                                current_patch_name = fn
+                                break
+
+                if skip_section:
+                    if i + 1 < len(lines) and re.match(r'^### \d{4}\s', lines[i + 1]):
+                        skip_section = False
+                    elif i + 1 >= len(lines):
+                        skip_section = False
+                    else:
+                        i += 1
+                        continue
+
+                new_lines.append(line)
+
+                # After a combined patch's section, add a note about absorbed patches
+                if current_patch_name and line.strip().startswith("- **Description:**"):
+                    absorbed = combined_into[current_patch_name]
+                    absorbed_names = ", ".join(absorbed)
+                    new_lines.append(
+                        f"- **Note:** Includes changes from: {absorbed_names}\n"
+                    )
+                    current_patch_name = None
+
+                i += 1
+
+            with open(claude_path, 'w') as f:
+                f.writelines(new_lines)
+            print("Updated CLAUDE.md", file=sys.stderr)
+
         print(json.dumps({"packages": all_results}))
         PYEOF
       timeout: 600000
