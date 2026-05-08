@@ -120,11 +120,14 @@ methods:
             try:
                 # Apply patch at old version (where it was designed to work)
                 reset_repo(repo_path, old_tag)
-                r = run(f"patch --no-backup-if-mismatch -p1 < {tmp_path}", cwd=repo_path, check=False)
+                r = run(f"patch --no-backup-if-mismatch --forward -p1 < {tmp_path}", cwd=repo_path, check=False)
                 os.unlink(tmp_path)
                 run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
 
                 if r.returncode != 0:
+                    if "Reversed (or previously applied)" in r.stdout:
+                        reset_repo(repo_path, new_tag)
+                        return "", "upstreamed (already applied at old tag)"
                     reset_repo(repo_path, new_tag)
                     return None, f"patch does not apply at old tag {old_tag}: {r.stderr}"
 
@@ -207,10 +210,12 @@ methods:
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as tmp:
                     tmp.write(filtered)
                     tmp_path = tmp.name
-                r = run(f"patch --no-backup-if-mismatch -p1 < {tmp_path}", cwd=repo_path, check=False)
+                r = run(f"patch --no-backup-if-mismatch --forward -p1 < {tmp_path}", cwd=repo_path, check=False)
                 os.unlink(tmp_path)
                 run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
                 if r.returncode != 0:
+                    if "Reversed (or previously applied)" in r.stdout:
+                        continue  # Skip this patch — already applied at old tag
                     reset_repo(repo_path, new_tag)
                     return None, f"{mp['filename']} does not apply at old tag"
 
@@ -244,7 +249,7 @@ methods:
         def verify_patch(repo_path, new_tag, patch_path):
             """Check that a patch applies cleanly and produces valid Python."""
             reset_repo(repo_path, new_tag)
-            r = run(f"patch --dry-run -p1 < {patch_path}", cwd=repo_path, check=False)
+            r = run(f"patch --dry-run --forward -p1 < {patch_path}", cwd=repo_path, check=False)
             if r.returncode != 0:
                 return False, f"patch does not apply: {r.stdout}"
             run(f"patch --no-backup-if-mismatch -p1 < {patch_path}", cwd=repo_path, check=False)
@@ -420,9 +425,15 @@ methods:
 
                     # Test clean apply
                     reset_repo(repo_path, new_tag)
-                    dry = run(f"patch --dry-run -p1 < {pf}", cwd=repo_path, check=False)
+                    dry = run(f"patch --dry-run --forward -p1 < {pf}", cwd=repo_path, check=False)
                     if dry.returncode == 0:
                         patch_results.append({"filename": fname, "status": "applied", "details": "Applied cleanly"})
+                        continue
+                    if "Reversed (or previously applied)" in dry.stdout:
+                        print(f"  {fname}: upstreamed (reversed at new tag)", file=sys.stderr)
+                        os.remove(pf)
+                        remove_patch_from_dockerfile(dockerfile_path, fname)
+                        patch_results.append({"filename": fname, "status": "upstreamed", "details": "Deleted — already in new version"})
                         continue
 
                     if not old_tag:
@@ -459,11 +470,24 @@ methods:
 
                 else:
                     # Multi-patch group: test each independently first
-                    independent, needs_work = [], []
+                    independent, needs_work, upstreamed_in_group = [], [], []
                     for mp in group:
                         reset_repo(repo_path, new_tag)
-                        dry = run(f"patch --dry-run -p1 < {mp['path']}", cwd=repo_path, check=False)
-                        (independent if dry.returncode == 0 else needs_work).append(mp)
+                        dry = run(f"patch --dry-run --forward -p1 < {mp['path']}", cwd=repo_path, check=False)
+                        if dry.returncode == 0:
+                            independent.append(mp)
+                        elif "Reversed (or previously applied)" in dry.stdout:
+                            upstreamed_in_group.append(mp)
+                        else:
+                            needs_work.append(mp)
+
+                    for mp in upstreamed_in_group:
+                        fname = mp["filename"]
+                        print(f"  {fname}: upstreamed (reversed at new tag)", file=sys.stderr)
+                        if os.path.isfile(mp["path"]):
+                            os.remove(mp["path"])
+                        remove_patch_from_dockerfile(dockerfile_path, fname)
+                        patch_results.append({"filename": fname, "status": "upstreamed", "details": "Deleted — already in new version"})
 
                     if not needs_work:
                         for mp in independent:
@@ -478,7 +502,7 @@ methods:
                             run(f"patch --no-backup-if-mismatch -p1 < {mp['path']}", cwd=repo_path, check=False)
                             run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
                         for mp in needs_work:
-                            dry = run(f"patch --dry-run -p1 < {mp['path']}", cwd=repo_path, check=False)
+                            dry = run(f"patch --dry-run --forward -p1 < {mp['path']}", cwd=repo_path, check=False)
                             (depends if dry.returncode == 0 else truly_broken).append(mp)
                     else:
                         truly_broken = needs_work
