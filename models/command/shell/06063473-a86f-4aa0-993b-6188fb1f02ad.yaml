@@ -105,8 +105,64 @@ methods:
                 groups.append(group)
             return groups
 
+        def _regenerate_per_file(repo_path, old_tag, new_tag, patch_path, patch_prefix, filtered):
+            """Fallback: apply at old tag, merge each file into new tag individually."""
+            try:
+                reset_repo(repo_path, old_tag)
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as tmp:
+                    tmp.write(filtered)
+                    tmp_path = tmp.name
+                run(f"patch --no-backup-if-mismatch --forward -p1 < {tmp_path}", cwd=repo_path, check=False)
+                os.unlink(tmp_path)
+                run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
+
+                # For each modified file, do a 3-way merge
+                modified = run("git diff --name-only", cwd=repo_path, check=False).stdout.strip().splitlines()
+                patched_old = {}
+                for f in modified:
+                    fp = os.path.join(repo_path, f)
+                    if os.path.isfile(fp):
+                        with open(fp) as fh:
+                            patched_old[f] = fh.read()
+
+                reset_repo(repo_path, new_tag)
+
+                for f, patched_content in patched_old.items():
+                    fp = os.path.join(repo_path, f)
+                    base = run(f"git show {old_tag}:{f}", cwd=repo_path, check=False).stdout
+                    current = run(f"git show {new_tag}:{f}", cwd=repo_path, check=False).stdout
+
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.base', delete=False) as bf:
+                        bf.write(base)
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.other', delete=False) as of:
+                        of.write(patched_content)
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.current', delete=False) as cf:
+                        cf.write(current)
+
+                    run(f"git merge-file --theirs {cf.name} {bf.name} {of.name}", cwd=repo_path, check=False)
+
+                    with open(cf.name) as fh:
+                        merged = fh.read()
+                    os.unlink(bf.name)
+                    os.unlink(of.name)
+                    os.unlink(cf.name)
+
+                    with open(fp, 'w') as fh:
+                        fh.write(merged)
+
+                new_diff = run("git diff", cwd=repo_path, check=False).stdout
+                reset_repo(repo_path, new_tag)
+
+                if not new_diff.strip():
+                    return "", "upstreamed (per-file merge produced no diff)"
+                return new_diff, None
+
+            except Exception as e:
+                reset_repo(repo_path, new_tag)
+                return None, str(e)
+
         def regenerate_patch(repo_path, old_tag, new_tag, patch_path, patch_prefix):
-            """Apply patch at old tag, diff result against new tag."""
+            """Apply patch at old tag, rebase onto new tag to get clean diff."""
             with open(patch_path) as f:
                 full_content = f.read()
             filtered = filter_patch_for_prefix(full_content, patch_prefix)
@@ -117,9 +173,12 @@ methods:
                 tmp.write(filtered)
                 tmp_path = tmp.name
 
+            branch = f"regen-{os.path.basename(patch_path).replace('.patch', '')}"
             try:
-                # Apply patch at old version (where it was designed to work)
+                run(f"git branch -D {branch} 2>/dev/null", cwd=repo_path, check=False)
                 reset_repo(repo_path, old_tag)
+                run(f"git checkout -b {branch}", cwd=repo_path)
+
                 r = run(f"patch --no-backup-if-mismatch --forward -p1 < {tmp_path}", cwd=repo_path, check=False)
                 os.unlink(tmp_path)
                 run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
@@ -127,124 +186,89 @@ methods:
                 if r.returncode != 0:
                     if "Reversed (or previously applied)" in r.stdout:
                         reset_repo(repo_path, new_tag)
+                        run(f"git branch -D {branch}", cwd=repo_path, check=False)
                         return "", "upstreamed (already applied at old tag)"
                     reset_repo(repo_path, new_tag)
+                    run(f"git branch -D {branch}", cwd=repo_path, check=False)
                     return None, f"patch does not apply at old tag {old_tag}: {r.stderr}"
 
-                # Get list of files the patch modified
-                modified = run("git diff --name-only", cwd=repo_path, check=False).stdout.strip().splitlines()
-                # Also check for new files
-                untracked = run("git ls-files --others --exclude-standard", cwd=repo_path, check=False).stdout.strip().splitlines()
-                all_changed = [f for f in modified + untracked if f]
+                run("git add -A", cwd=repo_path)
+                run(f'git commit --allow-empty -m "apply patch"', cwd=repo_path)
 
-                if not all_changed:
+                r = run(f"git rebase {new_tag}", cwd=repo_path, check=False)
+                if r.returncode != 0:
+                    # Rebase failed — fall back to per-file approach
+                    run("git rebase --abort", cwd=repo_path, check=False)
                     reset_repo(repo_path, new_tag)
-                    return "", "upstreamed (patch produced no changes at old tag)"
+                    run(f"git branch -D {branch}", cwd=repo_path, check=False)
+                    return _regenerate_per_file(repo_path, old_tag, new_tag, patch_path, patch_prefix, filtered)
 
-                # Save the patched file contents
-                patched_files = {}
-                for f in all_changed:
-                    fp = os.path.join(repo_path, f)
-                    if os.path.isfile(fp):
-                        with open(fp) as fh:
-                            patched_files[f] = fh.read()
-
-                # Checkout new tag and compare
-                reset_repo(repo_path, new_tag)
-
-                # For each file, check if the patched content differs from new version
-                diff_parts = []
-                for f in all_changed:
-                    fp = os.path.join(repo_path, f)
-                    new_exists = os.path.isfile(fp)
-
-                    if new_exists:
-                        with open(fp) as fh:
-                            new_content = fh.read()
-                    else:
-                        new_content = ""
-
-                    patched_content = patched_files.get(f, "")
-
-                    if patched_content == new_content:
-                        continue  # This file's changes are upstreamed
-
-                    # Write patched content and get diff
-                    with open(fp, 'w') as fh:
-                        fh.write(patched_content)
-
-                new_diff = run("git diff", cwd=repo_path, check=False).stdout
-
-                # Also capture any new files
-                for f in untracked:
-                    if f in patched_files:
-                        fp = os.path.join(repo_path, f)
-                        if not os.path.isfile(fp):
-                            with open(fp, 'w') as fh:
-                                fh.write(patched_files[f])
-                        new_file_diff = run(f"git diff /dev/null -- '{f}'", cwd=repo_path, check=False).stdout
-                        if new_file_diff:
-                            new_diff += new_file_diff
+                new_diff = run(f"git diff {new_tag}", cwd=repo_path, check=False).stdout
 
                 reset_repo(repo_path, new_tag)
+                run(f"git branch -D {branch}", cwd=repo_path, check=False)
 
                 if not new_diff.strip():
-                    return "", "upstreamed (all changes present in new version)"
+                    return "", "upstreamed (no diff after rebase)"
 
                 return new_diff, None
 
             except Exception as e:
+                run("git rebase --abort 2>/dev/null", cwd=repo_path, check=False)
                 reset_repo(repo_path, new_tag)
+                run(f"git branch -D {branch} 2>/dev/null", cwd=repo_path, check=False)
                 return None, str(e)
 
         def combine_patches(repo_path, old_tag, new_tag, group, patch_prefix):
-            """Apply all patches in group at old tag, diff result against new tag."""
-            reset_repo(repo_path, old_tag)
+            """Apply all patches in group at old tag, replay onto new tag via rebase."""
+            branch = "regen-combine"
+            try:
+                run(f"git branch -D {branch} 2>/dev/null", cwd=repo_path, check=False)
+                reset_repo(repo_path, old_tag)
+                run(f"git checkout -b {branch}", cwd=repo_path)
 
-            for mp in group:
-                with open(mp['path']) as f:
-                    content = f.read()
-                filtered = filter_patch_for_prefix(content, patch_prefix)
-                if not filtered.strip():
-                    continue
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as tmp:
-                    tmp.write(filtered)
-                    tmp_path = tmp.name
-                r = run(f"patch --no-backup-if-mismatch --forward -p1 < {tmp_path}", cwd=repo_path, check=False)
-                os.unlink(tmp_path)
-                run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
+                for mp in group:
+                    with open(mp['path']) as f:
+                        content = f.read()
+                    filtered = filter_patch_for_prefix(content, patch_prefix)
+                    if not filtered.strip():
+                        continue
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as tmp:
+                        tmp.write(filtered)
+                        tmp_path = tmp.name
+                    r = run(f"patch --no-backup-if-mismatch --forward -p1 < {tmp_path}", cwd=repo_path, check=False)
+                    os.unlink(tmp_path)
+                    run("find . -name '*.orig' -o -name '*.rej' | xargs rm -f", cwd=repo_path, check=False)
+                    if r.returncode != 0:
+                        if "Reversed (or previously applied)" in r.stdout:
+                            continue
+                        reset_repo(repo_path, new_tag)
+                        run(f"git branch -D {branch}", cwd=repo_path, check=False)
+                        return None, f"{mp['filename']} does not apply at old tag"
+
+                run("git add -A", cwd=repo_path)
+                run('git commit --allow-empty -m "combined patches"', cwd=repo_path)
+
+                r = run(f"git rebase {new_tag}", cwd=repo_path, check=False)
                 if r.returncode != 0:
-                    if "Reversed (or previously applied)" in r.stdout:
-                        continue  # Skip this patch — already applied at old tag
+                    run("git rebase --abort", cwd=repo_path, check=False)
                     reset_repo(repo_path, new_tag)
-                    return None, f"{mp['filename']} does not apply at old tag"
+                    run(f"git branch -D {branch}", cwd=repo_path, check=False)
+                    return None, "rebase failed — patches conflict with upstream changes"
 
-            # Save patched state
-            patched_files = {}
-            modified = run("git diff --name-only", cwd=repo_path, check=False).stdout.strip().splitlines()
-            untracked = run("git ls-files --others --exclude-standard", cwd=repo_path, check=False).stdout.strip().splitlines()
-            for f in modified + untracked:
-                if not f:
-                    continue
-                fp = os.path.join(repo_path, f)
-                if os.path.isfile(fp):
-                    with open(fp) as fh:
-                        patched_files[f] = fh.read()
+                combined_diff = run(f"git diff {new_tag}", cwd=repo_path, check=False).stdout
+                reset_repo(repo_path, new_tag)
+                run(f"git branch -D {branch}", cwd=repo_path, check=False)
 
-            # Diff against new tag
-            reset_repo(repo_path, new_tag)
-            for f, content in patched_files.items():
-                fp = os.path.join(repo_path, f)
-                os.makedirs(os.path.dirname(fp), exist_ok=True)
-                with open(fp, 'w') as fh:
-                    fh.write(content)
+                if not combined_diff.strip():
+                    return "", "all changes upstreamed"
+                return combined_diff, None
 
-            combined_diff = run("git diff", cwd=repo_path, check=False).stdout
-            reset_repo(repo_path, new_tag)
-
-            if not combined_diff.strip():
-                return "", "all changes upstreamed"
-            return combined_diff, None
+            except Exception as e:
+                run("git rebase --abort 2>/dev/null", cwd=repo_path, check=False)
+                reset_repo(repo_path, new_tag)
+                run(f"git branch -D {branch} 2>/dev/null", cwd=repo_path, check=False)
+                return None, str(e)
 
         def verify_patch(repo_path, new_tag, patch_path):
             """Check that a patch applies cleanly and produces valid Python."""
